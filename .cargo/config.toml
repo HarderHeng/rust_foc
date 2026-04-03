@@ -1,12 +1,10 @@
 [target.thumbv7em-none-eabihf]
 runner = "probe-rs run --chip STM32G431CB"
-
-[build]
-target = "thumbv7em-none-eabihf"
-
-[target.thumbv7em-none-eabihf.rustflags]
 rustflags = [
     "-C", "linker=flip-link",
     "-C", "link-arg=-Tmemory.x",
     "-C", "link-arg=-Tdefmt.x",
 ]
+
+[build]
+target = "thumbv7em-none-eabihf"
