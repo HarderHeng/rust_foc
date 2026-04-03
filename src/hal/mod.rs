@@ -1,5 +1,3 @@
-//! HAL traits (future FOC abstraction)
+//! HAL trait definitions for FOC motor control
 //!
-//! This module will contain hardware abstraction layer traits.
-
-// Placeholder for future HAL trait implementations
+//! Currently empty - will be populated when FOC is implemented.

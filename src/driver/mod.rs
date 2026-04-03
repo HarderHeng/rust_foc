@@ -1,5 +1,7 @@
-//! Peripheral drivers (LED, shell)
-//!
-//! This module will contain driver implementations for board peripherals.
+//! Driver layer - hardware abstraction for peripherals
 
-// Placeholder for future driver implementations
+pub mod led;
+pub mod shell;
+
+pub use led::*;
+pub use shell::*;
