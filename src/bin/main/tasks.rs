@@ -60,7 +60,13 @@ pub async fn encoder_task(mut enc: As5600) {
 
 #[embassy_executor::task]
 pub async fn analog_task() {
+    let mut last = Instant::now();
     loop {
+        let now = Instant::now();
+        let dt_ms = now.duration_since(last).as_millis().max(1) as u32;
+        last = now;
+        control::tick(dt_ms);
+
         if let Some(s) = analog::read_bus() {
             telemetry::publish_bus(s);
             let mv = telemetry::vbus_mv();
@@ -75,8 +81,6 @@ pub async fn analog_task() {
         } else if control::cmd_timed_out() {
             control::fault(control::FaultKind::CmdTimeout);
         }
-        control::poll_refs();
-        control::poll_align();
         Timer::after_millis(1).await;
     }
 }

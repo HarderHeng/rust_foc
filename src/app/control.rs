@@ -1,9 +1,8 @@
-//! Runtime mode and references. Embassy and the current ISR share this.
+//! Runtime mode and references. The current ISR and 1 kHz supervisor share this.
+//! Time comes in as `dt_ms` from the analog task — not `embassy_time`.
 //! Hardware enable/duty go through here only — not through the shell.
 
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
-
-use embassy_time::{Duration, Instant};
 
 use crate::app::{foc_isr, telemetry};
 use crate::app::speed as speed_loop;
@@ -115,9 +114,14 @@ static CUR_KI: AtomicU32 = AtomicU32::new(0);
 static SPD_KP: AtomicU32 = AtomicU32::new(0);
 static SPD_KI: AtomicU32 = AtomicU32::new(0);
 static LAST_FAULT: AtomicU8 = AtomicU8::new(FaultKind::None as u8);
-static LAST_CMD_TICKS: AtomicU32 = AtomicU32::new(0);
-static ALIGN_START_TICKS: AtomicU32 = AtomicU32::new(0);
+static NOW_MS: AtomicU32 = AtomicU32::new(0);
+static LAST_CMD_MS: AtomicU32 = AtomicU32::new(0);
+static ALIGN_START_MS: AtomicU32 = AtomicU32::new(0);
 static ALIGN_HOLDING: AtomicBool = AtomicBool::new(false);
+
+fn now_ms() -> u32 {
+    NOW_MS.load(Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy)]
 pub struct Snapshot {
@@ -249,7 +253,7 @@ pub fn last_fault() -> FaultKind {
 }
 
 pub fn touch_cmd() {
-    LAST_CMD_TICKS.store(Instant::now().as_ticks() as u32, Ordering::Relaxed);
+    LAST_CMD_MS.store(now_ms(), Ordering::Relaxed);
 }
 
 /// Run with a non-zero Id/Iq target: trip if the operator goes silent.
@@ -258,9 +262,16 @@ pub fn cmd_timed_out() -> bool {
     if mode() != Mode::Run || (id_target_ma() == 0 && iq_target_ma() == 0) {
         return false;
     }
-    let now = Instant::now().as_ticks() as u32;
-    let last = LAST_CMD_TICKS.load(Ordering::Relaxed);
-    Duration::from_ticks(u64::from(now.wrapping_sub(last))) > Duration::from_millis(u64::from(CMD_TIMEOUT_MS))
+    now_ms().wrapping_sub(LAST_CMD_MS.load(Ordering::Relaxed)) > CMD_TIMEOUT_MS
+}
+
+/// 1 kHz supervisor: advance the control clock, then slew refs and align.
+/// `dt_ms` is wall time from the analog task (Embassy stays at that edge).
+pub fn tick(dt_ms: u32) {
+    let dt = dt_ms.max(1);
+    NOW_MS.fetch_add(dt, Ordering::Relaxed);
+    poll_refs(dt);
+    poll_align();
 }
 
 /// Blocking regular-ADC offset. PWM must be off.
@@ -299,7 +310,7 @@ pub fn poll_align() {
     if !ALIGN_HOLDING.load(Ordering::Relaxed) {
         if (id_ma() - ID_TGT_MA.load(Ordering::Relaxed)).unsigned_abs() <= 2 {
             ALIGN_HOLDING.store(true, Ordering::Relaxed);
-            ALIGN_START_TICKS.store(Instant::now().as_ticks() as u32, Ordering::Relaxed);
+            ALIGN_START_MS.store(now_ms(), Ordering::Relaxed);
         }
         return;
     }
@@ -315,10 +326,8 @@ pub fn align_left_ms() -> u32 {
     if !ALIGN_HOLDING.load(Ordering::Relaxed) {
         return ALIGN_MS;
     }
-    let start = ALIGN_START_TICKS.load(Ordering::Relaxed);
-    let now = Instant::now().as_ticks() as u32;
-    let gone_ms = Duration::from_ticks(u64::from(now.wrapping_sub(start))).as_millis() as u32;
-    ALIGN_MS.saturating_sub(gone_ms)
+    let gone = now_ms().wrapping_sub(ALIGN_START_MS.load(Ordering::Relaxed));
+    ALIGN_MS.saturating_sub(gone)
 }
 
 fn finish_align() {
@@ -355,23 +364,23 @@ pub fn write_iq_ma(ma: i32) {
     IQ_TGT_MA.store(v, Ordering::Relaxed);
 }
 
-/// 1 ms: slew Id/Iq (Run/Align) and rpm (Speed). ISR reads the slewed values.
-pub fn poll_refs() {
-    const DT: f32 = 0.001;
+/// Slew Id/Iq (Run/Align) and rpm (Speed). ISR reads the slewed values.
+pub fn poll_refs(dt_ms: u32) {
+    let dt = dt_ms.max(1) as f32 / 1000.0;
     let ma_s = IDQ_RAMP_A_S * 1000.0;
     match mode() {
         Mode::Align | Mode::Run => {
-            let id = approach_i32(id_ma(), ID_TGT_MA.load(Ordering::Relaxed), ma_s, DT);
+            let id = approach_i32(id_ma(), ID_TGT_MA.load(Ordering::Relaxed), ma_s, dt);
             ID_MA.store(id, Ordering::Relaxed);
         }
         _ => {}
     }
     if mode() == Mode::Run {
-        let iq = approach_i32(iq_ma(), IQ_TGT_MA.load(Ordering::Relaxed), ma_s, DT);
+        let iq = approach_i32(iq_ma(), IQ_TGT_MA.load(Ordering::Relaxed), ma_s, dt);
         IQ_MA.store(iq, Ordering::Relaxed);
     }
     if mode() == Mode::Speed {
-        let rpm = approach_i32(rpm_ref(), RPM_TGT.load(Ordering::Relaxed), RPM_RAMP_RPM_S, DT);
+        let rpm = approach_i32(rpm_ref(), RPM_TGT.load(Ordering::Relaxed), RPM_RAMP_RPM_S, dt);
         RPM_REF.store(rpm, Ordering::Relaxed);
     }
 }
