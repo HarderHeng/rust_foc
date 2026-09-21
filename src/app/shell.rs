@@ -18,8 +18,8 @@ const LED_SUB: &[&str] = &["on", "off", "toggle"];
 const SYSTEM_SUB: &[&str] = &["info"];
 const CAL_SUB: &[&str] = &["current"];
 const FOC_SUB: &[&str] = &[
-    "status", "start", "stop", "align", "id", "iq", "poles", "pwm", "offset", "zero", "openloop", "rpm", "kp",
-    "ki", "skp", "ski",
+    "status", "start", "stop", "align", "id", "iq", "poles", "pwm", "offset", "zero", "save",
+    "openloop", "rpm", "kp", "ki", "skp", "ski", "isr",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,7 +67,9 @@ impl Shell {
 
     pub async fn run(&mut self, rx: &mut RingBufferedUartRx<'static>, led: &'static LedHandle) {
         let _ = self
-            .write_all(b"STM32G431 FOC v0.1.0\r\nType 'help'. Tab completes, up/down is history.\r\n")
+            .write_all(
+                b"STM32G431 FOC v0.1.0\r\nType 'help'. Tab completes, up/down is history.\r\n",
+            )
             .await;
         let _ = self.write_all(PROMPT).await;
 
@@ -199,7 +201,9 @@ impl Shell {
         }
         if self.hist_count > 0 {
             let last = (self.hist_head + HIST_CAP - 1) % HIST_CAP;
-            if self.hist_len[last] == line.len() && self.hist[last][..line.len()] == *line.as_bytes() {
+            if self.hist_len[last] == line.len()
+                && self.hist[last][..line.len()] == *line.as_bytes()
+            {
                 return;
             }
         }
@@ -339,7 +343,7 @@ impl Shell {
                     b"help | hello [name] | clear | version | echo [text]\r\n\
                       led on|off|toggle | system info | enc | adc | cal current\r\n\
                       foc status|start|stop|align [mA]|id <mA>|iq <mA>|poles <n>|pwm <%>\r\n\
-                      foc kp|ki|skp|ski [x] | rpm <n> | openloop <vq_mV> <Hz>\r\n\
+                      foc offset|zero|save|isr | kp|ki|skp|ski [x] | rpm <n> | openloop <vq_mV> <Hz>\r\n\
                       Tab: complete   Up/Down: history   Ctrl-C/U: abort/kill\r\n",
                 )
                 .await;
@@ -463,15 +467,29 @@ impl Shell {
                 let _ = self.write_i32(app::iq_meas_ma() as i32).await;
                 let _ = self.write_all(b" mA off=").await;
                 let _ = self.write_i32(control::theta_e_off_mrad()).await;
-                let _ = self.write_all(b" mrad rpm=").await;
+                let _ = self.write_all(b" mrad nvm=").await;
+                let _ = self
+                    .write_all(if control::nvm_loaded() {
+                        b"ok"
+                    } else {
+                        b"empty"
+                    })
+                    .await;
+                let _ = self.write_all(b" rpm=").await;
                 let _ = self.write_i32(app::rpm_meas()).await;
                 let _ = self.write_all(b"/").await;
                 let _ = self.write_i32(control::rpm_ref()).await;
                 let _ = self.write_all(b" fault=").await;
-                let _ = self.write_all(control::last_fault().as_str().as_bytes()).await;
+                let _ = self
+                    .write_all(control::last_fault().as_str().as_bytes())
+                    .await;
                 let _ = self.write_all(b" vbus=").await;
                 let _ = self.write_i32(app::vbus_mv() as i32).await;
-                let _ = self.write_all(b" mV").await;
+                let _ = self.write_all(b" mV isr=").await;
+                let _ = self.write_i32(app::isr_us() as i32).await;
+                let _ = self.write_all(b"/").await;
+                let _ = self.write_i32(app::isr_us_max() as i32).await;
+                let _ = self.write_all(b" us").await;
                 if s.mode == control::Mode::Align {
                     let _ = self.write_all(b" align_left=").await;
                     let _ = self.write_i32(control::align_left_ms() as i32).await;
@@ -548,7 +566,8 @@ impl Shell {
                         control::set_theta_e_off_mrad(mrad);
                         let _ = self.write_all(b"theta_e_off=").await;
                         let _ = self.write_i32(control::theta_e_off_mrad()).await;
-                        let _ = self.write_all(b" mrad\r\n").await;
+                        let _ = self.write_all(b" mrad ").await;
+                        self.write_nvm_result().await;
                     }
                     None => {
                         let _ = self.write_all(b"usage: foc offset [mrad]\r\n").await;
@@ -588,7 +607,9 @@ impl Shell {
                     }
                 }
                 _ => {
-                    let _ = self.write_all(b"usage: foc openloop <vq_mV> <Hz>\r\n").await;
+                    let _ = self
+                        .write_all(b"usage: foc openloop <vq_mV> <Hz>\r\n")
+                        .await;
                 }
             },
             Some("kp") => self.cmd_gain("kp", toks.next(), true, true).await,
@@ -599,7 +620,26 @@ impl Shell {
                 control::capture_electrical_offset();
                 let _ = self.write_all(b"theta_e_off=").await;
                 let _ = self.write_i32(control::theta_e_off_mrad()).await;
-                let _ = self.write_all(b" mrad\r\n").await;
+                let _ = self.write_all(b" mrad ").await;
+                self.write_nvm_result().await;
+            }
+            Some("save") => {
+                self.write_nvm_result().await;
+            }
+            Some("isr") => {
+                let _ = self.write_all(b"isr last=").await;
+                let _ = self.write_i32(app::isr_us() as i32).await;
+                let _ = self.write_all(b" us max=").await;
+                let _ = self.write_i32(app::isr_us_max() as i32).await;
+                let _ = self.write_all(b" us cyc=").await;
+                let _ = self.write_i32(app::isr_cycles() as i32).await;
+                let _ = self.write_all(b"/").await;
+                let _ = self.write_i32(app::isr_cycles_max() as i32).await;
+                let _ = self.write_all(b"\r\n").await;
+                if toks.next() == Some("reset") {
+                    app::reset_isr_cycles();
+                    let _ = self.write_all(b"isr max cleared\r\n").await;
+                }
             }
             Some("pwm") => match parse_u8(toks.next()) {
                 Some(pct) => {
@@ -613,7 +653,7 @@ impl Shell {
                 }
             },
             _ => {
-                let _ = self.write_all(b"usage: foc status|start|stop|align [mA]|id|iq|poles|pwm|offset|zero|openloop|rpm|kp|ki|skp|ski\r\n").await;
+                let _ = self.write_all(b"usage: foc status|start|stop|align [mA]|id|iq|poles|pwm|offset|zero|save|isr [reset]|openloop|rpm|kp|ki|skp|ski\r\n").await;
             }
         }
     }
@@ -636,7 +676,9 @@ impl Shell {
                 control::set_speed_gains(kp, ki);
             }
         } else if arg.is_some() {
-            let _ = self.write_all(b"usage: foc kp|ki|skp|ski [value]\r\n").await;
+            let _ = self
+                .write_all(b"usage: foc kp|ki|skp|ski [value]\r\n")
+                .await;
             return;
         }
         let _ = self.write_all(name.as_bytes()).await;
@@ -649,6 +691,16 @@ impl Shell {
         };
         let _ = self.write_f32(val).await;
         let _ = self.write_all(b"\r\n").await;
+    }
+
+    async fn write_nvm_result(&mut self) {
+        if control::persist_nvm() {
+            let _ = self.write_all(b"nvm=ok\r\n").await;
+        } else if control::outputs_live() {
+            let _ = self.write_all(b"nvm=live (foc stop to save)\r\n").await;
+        } else {
+            let _ = self.write_all(b"nvm=fail\r\n").await;
+        }
     }
 
     async fn write_all(&mut self, buf: &[u8]) -> Result<(), ()> {
@@ -723,7 +775,12 @@ fn longest_common_prefix<'a>(words: &[&'a str]) -> &'a str {
     &first[..end]
 }
 
-fn apply_completion(line: &mut [u8; LINE_CAP], len: &mut usize, prefix: &str, filled: &str) -> bool {
+fn apply_completion(
+    line: &mut [u8; LINE_CAP],
+    len: &mut usize,
+    prefix: &str,
+    filled: &str,
+) -> bool {
     if filled.len() < prefix.len() {
         return false;
     }
@@ -740,8 +797,7 @@ fn maybe_space_after(line: &mut [u8; LINE_CAP], len: &mut usize, word: &str) {
     if matches!(
         word,
         "foc" | "led" | "system" | "cal" | "hello" | "echo" | "id" | "iq" | "poles" | "pwm"
-    )
-        && *len < LINE_CAP
+    ) && *len < LINE_CAP
         && (*len == 0 || line[*len - 1] != b' ')
     {
         line[*len] = b' ';
@@ -807,7 +863,11 @@ fn fmt_i32(v: i32, out: &mut [u8; 12]) -> usize {
         return 1;
     }
     let neg = v < 0;
-    let mut n = if neg { (v as i64).unsigned_abs() } else { v as u64 };
+    let mut n = if neg {
+        (v as i64).unsigned_abs()
+    } else {
+        v as u64
+    };
     let mut tmp = [0u8; 11];
     let mut i = 0;
     while n > 0 {

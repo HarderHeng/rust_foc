@@ -39,6 +39,8 @@ pub fn start(p: Peripherals) -> Board {
     foc_isr::init();
     speed::init();
     stm32g431_foc::app::control::init_gains();
+    stm32g431_foc::driver::nvm::init(p.FLASH);
+    stm32g431_foc::app::control::load_nvm();
     analog::init(
         p.OPAMP1, p.OPAMP2, p.OPAMP3, p.ADC1, p.ADC2, p.PA1, p.PA3, p.PA2, p.PA7, p.PA5, p.PA6, p.PB0,
         p.PB2, p.PB1, p.PA0, p.PB14,

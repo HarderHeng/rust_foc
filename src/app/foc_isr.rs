@@ -6,16 +6,16 @@ use static_cell::StaticCell;
 
 use crate::app::{control, telemetry};
 use crate::bsp::config::{
-    CURRENT_KI, CURRENT_KP, CURRENT_LOOP_TS, DEADTIME_DUTY, MOTOR_KE_VRMS_PER_KRPM, MOTOR_LS_H, NOMINAL_VBUS_V,
-    SW_OCP_A,
+    CURRENT_KI, CURRENT_KP, CURRENT_LOOP_TS, DEADTIME_DUTY, MOTOR_KE_VRMS_PER_KRPM, MOTOR_LS_H,
+    NOMINAL_VBUS_V, SW_OCP_A,
 };
 use crate::driver::analog::AnalogSample;
 use crate::driver::pwm::with_pwm;
 use crate::foc::current::openloop_voltage;
 use crate::foc::transforms::{clarke, park, wrap_2pi};
 use crate::foc::{
-    park_theta, CurrentLoop, DeadTime, Dq, DqFf, DutyMap, DutySink, FfOff, PhaseCurrents, VoltageFeedforward,
-    flux_from_ke_vrms_ll_krpm,
+    flux_from_ke_vrms_ll_krpm, park_theta, CurrentLoop, DeadTime, Dq, DqFf, DutyMap, DutySink,
+    FfOff, PhaseCurrents, VoltageFeedforward,
 };
 
 static LOOP: StaticCell<CurrentLoop> = StaticCell::new();
@@ -23,7 +23,12 @@ static LOOP_PTR: AtomicPtr<CurrentLoop> = AtomicPtr::new(core::ptr::null_mut());
 static OL_THETA_MRAD: AtomicI32 = AtomicI32::new(0);
 
 pub fn init() {
-    let slot = LOOP.init(CurrentLoop::new(CURRENT_KP, CURRENT_KI, NOMINAL_VBUS_V * 0.5));
+    enable_cyccnt();
+    let slot = LOOP.init(CurrentLoop::new(
+        CURRENT_KP,
+        CURRENT_KI,
+        NOMINAL_VBUS_V * 0.5,
+    ));
     LOOP_PTR.store(slot as *mut CurrentLoop, Ordering::Release);
 }
 
@@ -40,6 +45,12 @@ pub fn set_gains(kp: f32, ki: f32) {
 }
 
 pub fn on_injected(s: AnalogSample) {
+    let t0 = cortex_m::peripheral::DWT::cycle_count();
+    on_injected_inner(s);
+    telemetry::publish_isr_cycles(cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0));
+}
+
+fn on_injected_inner(s: AnalogSample) {
     telemetry::publish_currents(s);
 
     if s.iu_a.abs() > SW_OCP_A || s.iv_a.abs() > SW_OCP_A || s.iw_a.abs() > SW_OCP_A {
@@ -72,7 +83,10 @@ fn openloop_step(s: AnalogSample) {
     let meas = park(clarke(s.abc()), th);
     telemetry::publish_dq(meas);
 
-    let duties = DeadTime { shift: DEADTIME_DUTY }.map(openloop_voltage(0.0, control::ol_vq_v(), th, vbus), s.abc());
+    let duties = DeadTime {
+        shift: DEADTIME_DUTY,
+    }
+    .map(openloop_voltage(0.0, control::ol_vq_v(), th, vbus), s.abc());
     apply_duties(duties);
 }
 
@@ -123,11 +137,24 @@ fn step(s: AnalogSample) {
         return;
     };
 
-    apply_duties(DeadTime { shift: DEADTIME_DUTY }.map(duties, s.abc()));
+    apply_duties(
+        DeadTime {
+            shift: DEADTIME_DUTY,
+        }
+        .map(duties, s.abc()),
+    );
 }
 
 fn apply_duties(duties: crate::foc::Duties) {
     let _ = with_pwm(|p| crate::driver::analog::with_analog(|a| (p, a).apply(duties)));
+}
+
+fn enable_cyccnt() {
+    unsafe {
+        let mut core = cortex_m::Peripherals::steal();
+        core.DCB.enable_trace();
+        core.DWT.enable_cycle_counter();
+    }
 }
 
 fn with_loop<R>(f: impl FnOnce(&mut CurrentLoop) -> R) -> Option<R> {

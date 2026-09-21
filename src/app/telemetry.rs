@@ -2,6 +2,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicU16, AtomicU32, Ordering};
 
+use crate::bsp::config::SYSCLK_FREQ_HZ;
 use crate::driver::analog::AnalogSample;
 use crate::foc;
 
@@ -18,7 +19,10 @@ pub fn publish_angle(raw: u16, theta_m: f32, omega_m: f32, valid: bool) {
         return;
     }
     ENC_RAW.store(raw, Ordering::Relaxed);
-    ENC_MDEG.store((theta_m * 180_000.0 / core::f32::consts::PI) as i32, Ordering::Relaxed);
+    ENC_MDEG.store(
+        (theta_m * 180_000.0 / core::f32::consts::PI) as i32,
+        Ordering::Relaxed,
+    );
     ENC_OMEGA_MRAD.store((omega_m * 1000.0) as i32, Ordering::Relaxed);
     ENC_AGE_TICKS.store(0, Ordering::Release);
 }
@@ -68,6 +72,8 @@ static IV_RAW: AtomicU16 = AtomicU16::new(0);
 static IW_RAW: AtomicU16 = AtomicU16::new(0);
 static ID_MEAS_MA: AtomicI16 = AtomicI16::new(0);
 static IQ_MEAS_MA: AtomicI16 = AtomicI16::new(0);
+static ISR_CYCLES: AtomicU32 = AtomicU32::new(0);
+static ISR_CYCLES_MAX: AtomicU32 = AtomicU32::new(0);
 
 pub fn publish_analog(s: AnalogSample) {
     publish_currents(s);
@@ -91,6 +97,37 @@ pub fn publish_bus(s: AnalogSample) {
 pub fn publish_dq(dq: crate::foc::Dq) {
     ID_MEAS_MA.store((dq.d * 1000.0) as i16, Ordering::Relaxed);
     IQ_MEAS_MA.store((dq.q * 1000.0) as i16, Ordering::Relaxed);
+}
+
+/// Last JEOS ISR duration in CPU cycles (no defmt / no RTT in that path).
+pub fn publish_isr_cycles(cycles: u32) {
+    ISR_CYCLES.store(cycles, Ordering::Relaxed);
+    let _ = ISR_CYCLES_MAX.fetch_max(cycles, Ordering::Relaxed);
+}
+
+pub fn isr_cycles() -> u32 {
+    ISR_CYCLES.load(Ordering::Relaxed)
+}
+
+pub fn isr_cycles_max() -> u32 {
+    ISR_CYCLES_MAX.load(Ordering::Relaxed)
+}
+
+pub fn reset_isr_cycles() {
+    ISR_CYCLES.store(0, Ordering::Relaxed);
+    ISR_CYCLES_MAX.store(0, Ordering::Relaxed);
+}
+
+fn cycles_to_us(cycles: u32) -> u32 {
+    cycles / (SYSCLK_FREQ_HZ / 1_000_000)
+}
+
+pub fn isr_us() -> u32 {
+    cycles_to_us(isr_cycles())
+}
+
+pub fn isr_us_max() -> u32 {
+    cycles_to_us(isr_cycles_max())
 }
 
 pub fn id_meas_ma() -> i16 {

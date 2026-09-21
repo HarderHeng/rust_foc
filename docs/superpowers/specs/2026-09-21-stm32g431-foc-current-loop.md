@@ -67,7 +67,8 @@ Ia,Ib (,Ic) ─Clarke─Park(θe)─► Id,Iq
 - **Pid**: portable parallel PI/PID; clamps its own output; `track(applied)` for outer limits. No motor model, no voltage circle inside Pid.
 - **Vqd feed-forward** (`VoltageFeedforward`: `FfOff` / `DqFf`, after PI): `vd_ff = −ωe·Lq·iq*`, `vq_ff = ωe·Ld·id* + ωe·ψf` (`Ld=Lq=LS`, `ψf` from `Ke`). Align uses `FfOff`.
 - **Angle**: I2C1 `PB8=SCL` / `PB7=SDA` (J8 Z+/B+), 400 kHz, addr `0x36`. STATUS then ANGLE (not a STATUS burst). ~2 kHz poll. `foc::AngleTrack` unwraps/filters ω; ISR `θ + ω · age`. Invalid: hold CCR; trip after 20 ms in Run/Speed.
-- **Align**: `foc align [mA]` — hold `id` (default 500 mA), `iq=0`, `θe=0` for 500 ms, latch `θ_offset`, coast to Idle. Encoder invalid → `fault=enc`.
+- **Align**: `foc align [mA]` — hold `id` (default 500 mA), `iq=0`, `θe=0` for 500 ms, latch `θ_offset`, coast to Idle, **write last flash page** (`θe_off` + poles). Encoder invalid → `fault=enc`.
+- **NVM**: G431 last 2 KiB page (`0x0801F800`). Load at boot. Erase+program only with PWM off (`foc save` / align). Changing poles without re-align invalidates the stored zero.
 - **Ramps** (~1 kHz): Id/Iq 10 A/s in Align/Run; rpm 6420 rpm/s in Speed, starting from measured rpm.
 
 ## Timing
@@ -104,7 +105,7 @@ src/
     └── speed.rs / shell / telemetry
 ```
 
-**ISR budget (170 MHz, ~50 µs period):** keep the current step under ~15 µs. Use `f32`; G431 has FPU. Use CORDIC for `sin/cos` if the ISR is tight; otherwise `libm`/`micromath` is acceptable for the first bring-up.
+**ISR budget (170 MHz, ~50 µs period):** keep the current step under ~15 µs. Measure with `foc isr` (DWT `CYCCNT` → last/max µs on UART). Do not single-step or RTT-log inside the JEOS path. Use `f32`; G431 has FPU. Use CORDIC for `sin/cos` if the ISR is tight; otherwise `libm`/`micromath` is acceptable for the first bring-up.
 
 Embassy tasks must not take TIM1, ADC1/2, OPAMP1/2/3, or the ADC DMA channels used by the loop.
 
@@ -148,13 +149,14 @@ Embassy tasks must not take TIM1, ADC1/2, OPAMP1/2/3, or the ADC DMA channels us
 
 | Command | Action |
 |---------|--------|
-| `foc status` | mode, slewed refs, meas Id/Iq, offset, rpm, `fault=`, Vbus; `align_left` while aligning |
+| `foc status` | mode, slewed refs, meas Id/Iq, offset, rpm, `fault=`, Vbus, ISR last/max µs; `align_left` while aligning |
+| `foc isr` / `foc isr reset` | DWT cycle budget (UART, not RTT); reset peak |
 | `foc start` / `foc stop` | current loop / coast (MOE off) |
 | `foc id <mA>` / `foc iq <mA>` | targets; slewed at 10 A/s in Run |
 | `foc align [mA]` | forced-D hold then latch offset (default 500 mA / 500 ms) |
 | `foc rpm <n>` | speed mode; rpm slewed from measured speed |
 | `foc openloop <vq_mV> <Hz>` | fixed Vq, ramped θe |
-| `foc poles <n>` / `foc offset` / `foc zero` | pole pairs / electrical offset |
+| `foc poles <n>` / `foc offset` / `foc zero` / `foc save` | pole pairs / electrical offset; `save` writes the last flash page |
 | `foc kp\|ki\|skp\|ski` | current / speed gains |
 | `cal current` | shunt offset (PWM must be off) |
 
@@ -185,8 +187,8 @@ Embassy tasks must not take TIM1, ADC1/2, OPAMP1/2/3, or the ADC DMA channels us
 
 ## Build
 
-- Firmware: `cargo check --lib --bins` (default `thumbv7em-none-eabihf`); flash via `probe-rs` (`STM32G431CB`).
+- Firmware: `cargo check --lib --bins` (default `thumbv7em-none-eabihf`); flash via `probe-rs` (`STM32G431CB`). After flash, leave the debugger idle; FOC debug is USART2.
 - Host math tests: `cargo htest` (`foc` crate only; thumb has no libtest).
-- `DEFMT_LOG=info` in `.cargo/config.toml`.
+- `DEFMT_LOG=info` in `.cargo/config.toml` (not used in the current ISR). Unset to strip logs.
 
 `micromath` is used inside `foc/`. Embassy I2C for AS5600. Custom line editor on USART2 (not `embedded-cli`). No extra RTOS.

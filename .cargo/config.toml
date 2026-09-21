@@ -14,6 +14,7 @@ target = "thumbv7em-none-eabihf"
 # Unit tests need a host target (thumb has no libtest).
 htest = "test -p foc --target x86_64-unknown-linux-gnu"
 
-# Compile-time defmt filter. Unset means all `defmt::*` macros are stripped.
+# Compile-time defmt filter. Unset (or empty) strips every `defmt::*` call.
+# Keep for bring-up; drop it when you want the last bit of CPU for the current loop.
 [env]
 DEFMT_LOG = "info"

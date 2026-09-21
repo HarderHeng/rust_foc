@@ -17,15 +17,17 @@ cargo htest                       # host unit tests for foc/
 probe-rs run --chip STM32G431CB   # default cargo runner
 ```
 
-USART2 is **921600** 8N1 (PB3 TX / PB4 RX). `DEFMT_LOG=info` is set in `.cargo/config.toml`.
+USART2 is **921600** 8N1 (PB3 TX / PB4 RX). Tune and watch the loop on this UART (`foc status`, `foc isr`). Do not halt the core with a probe-rs/SWD breakpoint while PWM is live.
+
+`DEFMT_LOG=info` is in `.cargo/config.toml` for boot/NVM/UART errors. The 20 kHz ISR does not call `defmt`. Unset `DEFMT_LOG` later if you want those macros compiled out.
 
 ## First spin (shell)
 
 ```text
 foc stop
 cal current
-foc align          # or: foc align 500
-foc status         # off=… mrad, fault=none
+foc align          # or: foc align 500  (also writes flash NVM)
+foc status         # off=… mrad nvm=ok|empty, fault=none
 foc start
 foc iq 200         # mA, slewed at 10 A/s
 ```

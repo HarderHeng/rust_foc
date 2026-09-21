@@ -4,13 +4,14 @@
 
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 
-use crate::app::{foc_isr, telemetry};
 use crate::app::speed as speed_loop;
+use crate::app::{foc_isr, telemetry};
 use crate::bsp::config::{
-    ALIGN_ID_MA, ALIGN_MS, CMD_TIMEOUT_MS, CURRENT_KI, CURRENT_KP, IDQ_RAMP_A_S, MAX_CURRENT_MA, MOTOR_MAX_RPM,
-    RPM_RAMP_RPM_S, SPEED_KI, SPEED_KP, SPEED_RPM_MAX,
+    ALIGN_ID_MA, ALIGN_MS, CMD_TIMEOUT_MS, CURRENT_KI, CURRENT_KP, IDQ_RAMP_A_S, MAX_CURRENT_MA,
+    MOTOR_MAX_RPM, RPM_RAMP_RPM_S, SPEED_KI, SPEED_KP, SPEED_RPM_MAX,
 };
 use crate::driver::analog;
+use crate::driver::nvm;
 use crate::driver::pwm::with_pwm;
 use crate::foc::slew::approach_i32;
 use crate::foc::transforms::wrap_2pi;
@@ -345,6 +346,7 @@ fn finish_align() {
     foc_isr::reset();
     let _ = with_pwm(|p| p.disable());
     MODE.store(Mode::Idle as u8, Ordering::Relaxed);
+    let _ = persist_nvm();
 }
 
 pub fn set_id_ma(ma: i32) {
@@ -380,7 +382,12 @@ pub fn poll_refs(dt_ms: u32) {
         IQ_MA.store(iq, Ordering::Relaxed);
     }
     if mode() == Mode::Speed {
-        let rpm = approach_i32(rpm_ref(), RPM_TGT.load(Ordering::Relaxed), RPM_RAMP_RPM_S, dt);
+        let rpm = approach_i32(
+            rpm_ref(),
+            RPM_TGT.load(Ordering::Relaxed),
+            RPM_RAMP_RPM_S,
+            dt,
+        );
         RPM_REF.store(rpm, Ordering::Relaxed);
     }
 }
@@ -436,6 +443,37 @@ pub fn capture_electrical_offset() {
 
 pub fn set_theta_e_off_mrad(mrad: i32) {
     THETA_E_OFF_MRAD.store(mrad, Ordering::Relaxed);
+}
+
+/// Apply last flash record at boot. Missing/corrupt page leaves defaults.
+pub fn load_nvm() -> bool {
+    match nvm::load() {
+        Some(r) => {
+            THETA_E_OFF_MRAD.store(r.theta_e_off_mrad, Ordering::Relaxed);
+            POLES.store(r.poles.max(1), Ordering::Relaxed);
+            defmt::info!("nvm load off={} poles={}", r.theta_e_off_mrad, r.poles);
+            true
+        }
+        None => {
+            defmt::info!("nvm empty");
+            false
+        }
+    }
+}
+
+/// Erase+program the NVM page. Refuses while PWM is live.
+pub fn persist_nvm() -> bool {
+    if outputs_live() {
+        return false;
+    }
+    nvm::save(nvm::Record {
+        theta_e_off_mrad: theta_e_off_mrad(),
+        poles: poles(),
+    })
+}
+
+pub fn nvm_loaded() -> bool {
+    nvm::load().is_some()
 }
 
 pub fn theta_e_off() -> f32 {
