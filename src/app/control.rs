@@ -137,10 +137,10 @@ pub fn mode() -> Mode {
 }
 
 pub fn outputs_live() -> bool {
-    matches!(
-        mode(),
-        Mode::Bench | Mode::Align | Mode::Run | Mode::Openloop | Mode::Speed
-    )
+    match mode() {
+        Mode::Bench | Mode::Align | Mode::Run | Mode::Openloop | Mode::Speed => true,
+        Mode::Idle | Mode::Fault => false,
+    }
 }
 
 pub fn start() {
