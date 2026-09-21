@@ -22,3 +22,25 @@ pub fn svpwm(ab: AlphaBeta, vbus: f32) -> Duties {
 pub fn max_modulation(vbus: f32) -> f32 {
     vbus * 0.57735026919
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::foc::types::AlphaBeta;
+
+    #[test]
+    fn duties_in_unit_interval() {
+        let d = svpwm(AlphaBeta { alpha: 5.0, beta: 2.0 }, 12.0);
+        for x in [d.a, d.b, d.c] {
+            assert!((0.0..=1.0).contains(&x));
+        }
+    }
+
+    #[test]
+    fn zero_voltage_is_half() {
+        let d = svpwm(AlphaBeta { alpha: 0.0, beta: 0.0 }, 12.0);
+        assert!((d.a - 0.5).abs() < 1e-5);
+        assert!((d.b - 0.5).abs() < 1e-5);
+        assert!((d.c - 0.5).abs() < 1e-5);
+    }
+}

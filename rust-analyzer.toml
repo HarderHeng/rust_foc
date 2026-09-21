@@ -1,0 +1,7 @@
+# Embedded default target has no libtest. Don't typecheck --tests/--benches.
+[cargo]
+target = "thumbv7em-none-eabihf"
+allTargets = false
+
+[check]
+allTargets = false

@@ -1,16 +1,33 @@
 //! Async line shell over USART2. No embedded-cli, no block_on.
 
 use embassy_stm32::mode::Async;
-use embassy_stm32::usart::{UartRx, UartTx};
+use embassy_stm32::usart::{RingBufferedUartRx, UartTx};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
+use embassy_time::Timer;
 
 use crate::app;
 use crate::driver::led::Led;
 use crate::driver::pwm::with_pwm;
 
 const LINE_CAP: usize = 64;
+const HIST_CAP: usize = 8;
 const PROMPT: &[u8] = b"G431> ";
+
+const ROOT_CMDS: &[&str] = &[
+    "help", "?", "hello", "clear", "version", "echo", "led", "system", "enc", "foc",
+];
+const LED_SUB: &[&str] = &["on", "off", "toggle"];
+const SYSTEM_SUB: &[&str] = &["info"];
+const FOC_SUB: &[&str] = &["status", "start", "stop", "align", "id", "iq", "poles", "pwm"];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Esc {
+    None,
+    Esc,
+    Csi,
+    Ss3,
+}
 
 pub type LedHandle = Mutex<CriticalSectionRawMutex, Led>;
 
@@ -18,6 +35,19 @@ pub struct Shell {
     tx: UartTx<'static, Async>,
     line: [u8; LINE_CAP],
     len: usize,
+    hist: [[u8; LINE_CAP]; HIST_CAP],
+    hist_len: [usize; HIST_CAP],
+    hist_head: usize,
+    hist_count: usize,
+    /// `None` = editing draft; `Some(0)` = newest history entry.
+    hist_nav: Option<usize>,
+    draft: [u8; LINE_CAP],
+    draft_len: usize,
+    esc: Esc,
+    /// Drop a LF that follows CR so Windows `\r\n` submits once.
+    skip_lf: bool,
+    /// Visible line width last drawn (for erase without relying on CSI).
+    painted: usize,
 }
 
 impl Shell {
@@ -26,55 +56,284 @@ impl Shell {
             tx,
             line: [0; LINE_CAP],
             len: 0,
+            hist: [[0; LINE_CAP]; HIST_CAP],
+            hist_len: [0; HIST_CAP],
+            hist_head: 0,
+            hist_count: 0,
+            hist_nav: None,
+            draft: [0; LINE_CAP],
+            draft_len: 0,
+            esc: Esc::None,
+            skip_lf: false,
+            painted: 0,
         }
     }
 
-    pub async fn run(&mut self, rx: &mut UartRx<'static, Async>, led: &'static LedHandle) {
+    pub async fn run(&mut self, rx: &mut RingBufferedUartRx<'static>, led: &'static LedHandle) {
         let _ = self
-            .write_all(b"STM32G431 FOC v0.1.0\r\nType 'help' for commands\r\n")
+            .write_all(b"STM32G431 FOC v0.1.0\r\nType 'help'. Tab completes, up/down is history.\r\n")
             .await;
         let _ = self.write_all(PROMPT).await;
 
-        let mut byte = [0u8; 1];
+        let mut buf = [0u8; 64];
         loop {
-            match rx.read(&mut byte).await {
-                Ok(()) => self.on_byte(byte[0], led).await,
-                Err(e) => defmt::error!("UART RX error: {:?}", e),
+            match rx.read(&mut buf).await {
+                Ok(n) => {
+                    for &b in &buf[..n] {
+                        self.on_byte(b, led).await;
+                    }
+                }
+                Err(e) => {
+                    defmt::error!("UART RX error: {:?}", e);
+                    Timer::after_millis(10).await;
+                }
             }
         }
     }
 
     async fn on_byte(&mut self, b: u8, led: &'static LedHandle) {
-        match b {
-            b'\r' | b'\n' => {
-                let _ = self.write_all(b"\r\n").await;
-                if self.len > 0 {
-                    let mut tmp = [0u8; LINE_CAP];
-                    tmp[..self.len].copy_from_slice(&self.line[..self.len]);
-                    let n = self.len;
-                    self.len = 0;
-                    if let Ok(line) = core::str::from_utf8(&tmp[..n]) {
-                        self.dispatch(line.trim(), led).await;
-                    } else {
-                        let _ = self.write_all(b"bad utf8\r\n").await;
-                    }
+        if drop_crlf_lf(&mut self.skip_lf, b) {
+            return;
+        }
+
+        match self.esc {
+            Esc::None => {}
+            Esc::Esc => {
+                self.esc = match b {
+                    b'[' => Esc::Csi,
+                    b'O' => Esc::Ss3,
+                    _ => Esc::None,
+                };
+                if self.esc != Esc::None {
+                    return;
                 }
+                // Lone ESC then a real key: keep the key.
+            }
+            Esc::Csi => {
+                if matches!(b, b'0'..=b'9' | b';' | b'?') {
+                    return;
+                }
+                self.esc = Esc::None;
+                match b {
+                    b'A' => self.history_up().await,
+                    b'B' => self.history_down().await,
+                    _ => {}
+                }
+                return;
+            }
+            Esc::Ss3 => {
+                self.esc = Esc::None;
+                match b {
+                    b'A' => self.history_up().await,
+                    b'B' => self.history_down().await,
+                    _ => {}
+                }
+                return;
+            }
+        }
+
+        match b {
+            0x1b => self.esc = Esc::Esc,
+            0x03 => {
+                // Ctrl-C: abandon line
+                self.hist_nav = None;
+                self.len = 0;
+                self.painted = 0;
+                let _ = self.write_all(b"^C\r\n").await;
                 let _ = self.write_all(PROMPT).await;
             }
+            0x15 => {
+                // Ctrl-U: kill to start
+                self.hist_nav = None;
+                self.len = 0;
+                self.redraw_line().await;
+            }
+            b'\t' => {
+                self.hist_nav = None;
+                self.complete().await;
+            }
+            b'\r' => {
+                note_cr(&mut self.skip_lf);
+                self.submit(led).await;
+            }
+            b'\n' => self.submit(led).await,
             0x08 | 0x7F => {
+                self.hist_nav = None;
                 if self.len > 0 {
                     self.len -= 1;
+                    if self.painted > 0 {
+                        self.painted -= 1;
+                    }
                     let _ = self.write_all(b"\x08 \x08").await;
                 }
             }
             b if b.is_ascii_graphic() || b == b' ' => {
+                self.hist_nav = None;
                 if self.len < LINE_CAP {
                     self.line[self.len] = b;
                     self.len += 1;
+                    self.painted = self.len;
                     let _ = self.write_all(&[b]).await;
                 }
             }
             _ => {}
+        }
+    }
+
+    async fn submit(&mut self, led: &'static LedHandle) {
+        let _ = self.write_all(b"\r\n").await;
+        self.hist_nav = None;
+        self.painted = 0;
+        if self.len > 0 {
+            let mut tmp = [0u8; LINE_CAP];
+            tmp[..self.len].copy_from_slice(&self.line[..self.len]);
+            let n = self.len;
+            self.len = 0;
+            if let Ok(line) = core::str::from_utf8(&tmp[..n]) {
+                let line = line.trim();
+                self.push_history(line);
+                self.dispatch(line, led).await;
+            } else {
+                let _ = self.write_all(b"bad utf8\r\n").await;
+            }
+        }
+        let _ = self.write_all(PROMPT).await;
+    }
+
+    fn push_history(&mut self, line: &str) {
+        if line.is_empty() || line.len() > LINE_CAP {
+            return;
+        }
+        if self.hist_count > 0 {
+            let last = (self.hist_head + HIST_CAP - 1) % HIST_CAP;
+            if self.hist_len[last] == line.len() && self.hist[last][..line.len()] == *line.as_bytes() {
+                return;
+            }
+        }
+        let i = self.hist_head;
+        self.hist[i][..line.len()].copy_from_slice(line.as_bytes());
+        self.hist_len[i] = line.len();
+        self.hist_head = (self.hist_head + 1) % HIST_CAP;
+        if self.hist_count < HIST_CAP {
+            self.hist_count += 1;
+        }
+    }
+
+    fn hist_index(&self, nav: usize) -> usize {
+        (self.hist_head + HIST_CAP - 1 - nav) % HIST_CAP
+    }
+
+    fn load_hist(&mut self, nav: usize) {
+        let i = self.hist_index(nav);
+        let n = self.hist_len[i];
+        self.line[..n].copy_from_slice(&self.hist[i][..n]);
+        self.len = n;
+    }
+
+    async fn history_up(&mut self) {
+        if self.hist_count == 0 {
+            return;
+        }
+        match self.hist_nav {
+            None => {
+                self.draft[..self.len].copy_from_slice(&self.line[..self.len]);
+                self.draft_len = self.len;
+                self.hist_nav = Some(0);
+                self.load_hist(0);
+            }
+            Some(n) if n + 1 < self.hist_count => {
+                self.hist_nav = Some(n + 1);
+                self.load_hist(n + 1);
+            }
+            Some(_) => return,
+        }
+        self.redraw_line().await;
+    }
+
+    async fn history_down(&mut self) {
+        match self.hist_nav {
+            None => {}
+            Some(0) => {
+                self.hist_nav = None;
+                self.line[..self.draft_len].copy_from_slice(&self.draft[..self.draft_len]);
+                self.len = self.draft_len;
+                self.redraw_line().await;
+            }
+            Some(n) => {
+                self.hist_nav = Some(n - 1);
+                self.load_hist(n - 1);
+                self.redraw_line().await;
+            }
+        }
+    }
+
+    async fn redraw_line(&mut self) {
+        let _ = self.write_all(b"\r").await;
+        let _ = self.write_all(PROMPT).await;
+        let n = self.len;
+        if n > 0 {
+            let mut tmp = [0u8; LINE_CAP];
+            tmp[..n].copy_from_slice(&self.line[..n]);
+            let _ = self.write_all(&tmp[..n]).await;
+        }
+        if self.painted > n {
+            let extra = self.painted - n;
+            let spaces = [b' '; LINE_CAP];
+            let _ = self.write_all(&spaces[..extra]).await;
+            let backs = [0x08; LINE_CAP];
+            let _ = self.write_all(&backs[..extra]).await;
+        }
+        let _ = self.write_all(b"\x1b[K").await;
+        self.painted = n;
+    }
+
+    async fn complete(&mut self) {
+        let Ok(line) = core::str::from_utf8(&self.line[..self.len]) else {
+            return;
+        };
+        let words = completion_words(line);
+        let Some((prefix, list)) = words else { return };
+        let mut pfx_buf = [0u8; LINE_CAP];
+        let pfx_n = prefix.len();
+        pfx_buf[..pfx_n].copy_from_slice(prefix.as_bytes());
+
+        let mut matches: [&str; 12] = [""; 12];
+        let mut n = 0;
+        for &w in list {
+            if w.starts_with(prefix) && n < matches.len() {
+                matches[n] = w;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return;
+        }
+        let prefix = core::str::from_utf8(&pfx_buf[..pfx_n]).unwrap_or("");
+
+        let lcp = longest_common_prefix(&matches[..n]);
+        if lcp.len() > prefix.len() {
+            if apply_completion(&mut self.line, &mut self.len, prefix, lcp) && n == 1 {
+                maybe_space_after(&mut self.line, &mut self.len, lcp);
+            }
+            self.redraw_line().await;
+            if n == 1 {
+                return;
+            }
+        }
+
+        if n > 1 {
+            let _ = self.write_all(b"\r\n").await;
+            for i in 0..n {
+                if i > 0 {
+                    let _ = self.write_all(b" ").await;
+                }
+                let _ = self.write_all(matches[i].as_bytes()).await;
+            }
+            let _ = self.write_all(b"\r\n").await;
+            self.redraw_line().await;
+        } else if lcp.len() == prefix.len() {
+            maybe_space_after(&mut self.line, &mut self.len, matches[0]);
+            self.redraw_line().await;
         }
     }
 
@@ -86,7 +345,8 @@ impl Shell {
                 let _ = self.write_all(
                     b"help | hello [name] | clear | version | echo [text]\r\n\
                       led on|off|toggle | system info | enc\r\n\
-                      foc status|start|stop|align|id <mA>|iq <mA>|poles <n>|pwm <%>\r\n",
+                      foc status|start|stop|align|id <mA>|iq <mA>|poles <n>|pwm <%>\r\n\
+                      Tab: complete   Up/Down: history   Ctrl-C/U: abort/kill\r\n",
                 )
                 .await;
             }
@@ -250,6 +510,82 @@ impl Shell {
     }
 }
 
+/// Last token being typed, and the word list to complete against.
+fn completion_words(line: &str) -> Option<(&str, &'static [&'static str])> {
+    let ends_space = line.ends_with(' ');
+    let mut parts = line.split_whitespace();
+    let first = parts.next();
+    let second = parts.next();
+    let extra = parts.next();
+
+    if extra.is_some() {
+        return None;
+    }
+
+    match (first, second, ends_space) {
+        (None, _, _) => Some(("", ROOT_CMDS)),
+        (Some(a), None, false) => Some((a, ROOT_CMDS)),
+        (Some("foc"), None, true) => Some(("", FOC_SUB)),
+        (Some("foc"), Some(b), false) => Some((b, FOC_SUB)),
+        (Some("led"), None, true) => Some(("", LED_SUB)),
+        (Some("led"), Some(b), false) => Some((b, LED_SUB)),
+        (Some("system"), None, true) => Some(("", SYSTEM_SUB)),
+        (Some("system"), Some(b), false) => Some((b, SYSTEM_SUB)),
+        _ => None,
+    }
+}
+
+fn longest_common_prefix<'a>(words: &[&'a str]) -> &'a str {
+    let first = words[0];
+    let mut end = first.len();
+    for w in words.iter().skip(1) {
+        end = first
+            .as_bytes()
+            .iter()
+            .zip(w.as_bytes())
+            .take_while(|(a, b)| a == b)
+            .count()
+            .min(end);
+    }
+    &first[..end]
+}
+
+fn apply_completion(line: &mut [u8; LINE_CAP], len: &mut usize, prefix: &str, filled: &str) -> bool {
+    if filled.len() < prefix.len() {
+        return false;
+    }
+    let add = &filled.as_bytes()[prefix.len()..];
+    if *len + add.len() > LINE_CAP {
+        return false;
+    }
+    line[*len..*len + add.len()].copy_from_slice(add);
+    *len += add.len();
+    true
+}
+
+fn maybe_space_after(line: &mut [u8; LINE_CAP], len: &mut usize, word: &str) {
+    if matches!(word, "foc" | "led" | "system" | "hello" | "echo" | "id" | "iq" | "poles" | "pwm")
+        && *len < LINE_CAP
+        && (*len == 0 || line[*len - 1] != b' ')
+    {
+        line[*len] = b' ';
+        *len += 1;
+    }
+}
+
+/// After CR, the following LF must not submit again.
+fn drop_crlf_lf(skip_lf: &mut bool, b: u8) -> bool {
+    if *skip_lf {
+        *skip_lf = false;
+        return b == b'\n';
+    }
+    false
+}
+
+fn note_cr(skip_lf: &mut bool) {
+    *skip_lf = true;
+}
+
 fn parse_i32(s: Option<&str>) -> Option<i32> {
     s.and_then(|t| t.parse().ok())
 }
@@ -283,4 +619,78 @@ fn fmt_i32(v: i32, out: &mut [u8; 12]) -> usize {
         o += 1;
     }
     o
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crlf_submits_once() {
+        let mut skip = false;
+        assert!(!drop_crlf_lf(&mut skip, b'\r'));
+        note_cr(&mut skip);
+        assert!(drop_crlf_lf(&mut skip, b'\n'));
+        assert!(!drop_crlf_lf(&mut skip, b'a'));
+    }
+
+    #[test]
+    fn lf_only_is_not_dropped() {
+        let mut skip = false;
+        assert!(!drop_crlf_lf(&mut skip, b'\n'));
+    }
+
+    #[test]
+    fn complete_root_prefix() {
+        let (p, list) = completion_words("fo").unwrap();
+        assert_eq!(p, "fo");
+        assert!(list.contains(&"foc"));
+    }
+
+    #[test]
+    fn complete_foc_sub() {
+        let (p, list) = completion_words("foc s").unwrap();
+        assert_eq!(p, "s");
+        assert!(list.contains(&"start"));
+        assert!(list.contains(&"status"));
+        assert!(list.contains(&"stop"));
+    }
+
+    #[test]
+    fn complete_after_space() {
+        let (p, list) = completion_words("led ").unwrap();
+        assert_eq!(p, "");
+        assert_eq!(list, LED_SUB);
+    }
+
+    #[test]
+    fn complete_third_token_none() {
+        assert!(completion_words("foc id 100").is_none());
+    }
+
+    #[test]
+    fn apply_and_space() {
+        let mut line = [0u8; LINE_CAP];
+        line[..2].copy_from_slice(b"fo");
+        let mut len = 2;
+        assert!(apply_completion(&mut line, &mut len, "fo", "foc"));
+        maybe_space_after(&mut line, &mut len, "foc");
+        assert_eq!(&line[..len], b"foc ");
+    }
+
+    #[test]
+    fn lcp_help_hello() {
+        assert_eq!(longest_common_prefix(&["help", "hello"]), "hel");
+    }
+
+    #[test]
+    fn fmt_ints() {
+        let mut buf = [0u8; 12];
+        let n = fmt_i32(0, &mut buf);
+        assert_eq!(&buf[..n], b"0");
+        let n = fmt_i32(-42, &mut buf);
+        assert_eq!(&buf[..n], b"-42");
+        let n = fmt_i32(i32::MIN, &mut buf);
+        assert_eq!(&buf[..n], b"-2147483648");
+    }
 }

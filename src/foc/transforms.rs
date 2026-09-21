@@ -1,5 +1,6 @@
 //! Clarke / Park and inverses.
 
+#[cfg(not(test))]
 use micromath::F32Ext;
 
 use super::types::{AlphaBeta, Dq, PhaseAbc};
@@ -58,4 +59,47 @@ pub fn inv_clarke(ab: AlphaBeta) -> PhaseAbc {
 
 pub fn electrical_angle(theta_m: f32, offset_m: f32, pole_pairs: u8) -> f32 {
     wrap_2pi((theta_m - offset_m) * pole_pairs as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::foc::types::PhaseAbc;
+
+    fn close(a: f32, b: f32) {
+        assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+    }
+
+    #[test]
+    fn clarke_inv_roundtrip() {
+        let i = PhaseAbc {
+            a: 1.0,
+            b: -0.5,
+            c: -0.5,
+        };
+        let ab = clarke(i);
+        let back = inv_clarke(ab);
+        close(back.a, i.a);
+        close(back.b, i.b);
+        close(back.c, i.c);
+    }
+
+    #[test]
+    fn park_inv_roundtrip() {
+        let ab = AlphaBeta {
+            alpha: 0.3,
+            beta: -0.8,
+        };
+        let th = 1.2;
+        let dq = park(ab, th);
+        let back = inv_park(dq, th);
+        close(back.alpha, ab.alpha);
+        close(back.beta, ab.beta);
+    }
+
+    #[test]
+    fn wrap_negative() {
+        let x = wrap_2pi(-0.1);
+        assert!(x > 6.0 && x < 6.3);
+    }
 }
