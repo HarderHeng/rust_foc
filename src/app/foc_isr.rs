@@ -9,13 +9,13 @@ use crate::bsp::config::{
     CURRENT_KI, CURRENT_KP, CURRENT_LOOP_TS, DEADTIME_DUTY, MOTOR_KE_VRMS_PER_KRPM, MOTOR_LS_H, NOMINAL_VBUS_V,
     SW_OCP_A,
 };
-use crate::foc::svm::compensate_deadtime;
 use crate::driver::analog::AnalogSample;
 use crate::driver::pwm::with_pwm;
-use crate::foc::transforms::wrap_2pi;
 use crate::foc::current::openloop_voltage;
-use crate::foc::transforms::park;
-use crate::foc::{CurrentLoop, Dq, DqFf, dq_voltage_ff, flux_from_ke_vrms_ll_krpm};
+use crate::foc::transforms::{clarke, park, wrap_2pi};
+use crate::foc::{
+    CurrentLoop, DeadTime, Dq, DqFf, DutyMap, DutySink, PhaseCurrents, dq_voltage_ff, flux_from_ke_vrms_ll_krpm,
+};
 
 static LOOP: StaticCell<CurrentLoop> = StaticCell::new();
 static LOOP_PTR: AtomicPtr<CurrentLoop> = AtomicPtr::new(core::ptr::null_mut());
@@ -68,16 +68,10 @@ fn openloop_step(s: AnalogSample) {
     let th = wrap_2pi(OL_THETA_MRAD.load(Ordering::Relaxed) as f32 / 1000.0 + dth);
     OL_THETA_MRAD.store((th * 1000.0) as i32, Ordering::Relaxed);
 
-    let meas = park(crate::foc::transforms::clarke_two_phase(s.iu_a, s.iv_a), th);
+    let meas = park(clarke(s.abc()), th);
     telemetry::publish_dq(meas);
 
-    let duties = compensate_deadtime(
-        openloop_voltage(0.0, control::ol_vq_v(), th, vbus),
-        s.iu_a,
-        s.iv_a,
-        s.iw_a,
-        DEADTIME_DUTY,
-    );
+    let duties = DeadTime { shift: DEADTIME_DUTY }.map(openloop_voltage(0.0, control::ol_vq_v(), th, vbus), s.abc());
     apply_duties(duties);
 }
 
@@ -124,19 +118,19 @@ fn step(s: AnalogSample) {
     };
 
     let Some(duties) = with_loop(|l| {
-        let (meas, duties) = l.step(s.iu_a, s.iv_a, refs, theta_e, vbus, CURRENT_LOOP_TS, ff);
+        let (meas, duties) = l.step(s, refs, theta_e, vbus, CURRENT_LOOP_TS, ff);
         telemetry::publish_dq(meas);
         duties
     }) else {
         return;
     };
 
-    apply_duties(compensate_deadtime(duties, s.iu_a, s.iv_a, s.iw_a, DEADTIME_DUTY));
+    apply_duties(DeadTime { shift: DEADTIME_DUTY }.map(duties, s.abc()));
 }
 
 fn apply_duties(duties: crate::foc::Duties) {
-    let _ = with_pwm(|p| p.set_duties(duties));
-    let _ = crate::driver::analog::with_analog(|a| a.schedule_pair(duties));
+    let _ = with_pwm(|p| p.apply(duties));
+    let _ = crate::driver::analog::with_analog(|a| a.apply(duties));
 }
 
 fn with_loop<R>(f: impl FnOnce(&mut CurrentLoop) -> R) -> Option<R> {

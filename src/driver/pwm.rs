@@ -17,7 +17,7 @@ use embassy_stm32::timer::simple_pwm::{PwmPin, PwmPinConfig};
 use static_cell::StaticCell;
 
 use crate::bsp::config::{PWM_FREQ_HZ, pwm_deadtime_ticks, tw_after_ticks, tw_before_ticks};
-use crate::foc::Duties;
+use crate::foc::{Duties, DutySink};
 
 static PWM: StaticCell<MotorPwm> = StaticCell::new();
 static PWM_PTR: AtomicPtr<MotorPwm> = AtomicPtr::new(core::ptr::null_mut());
@@ -152,13 +152,7 @@ impl MotorPwm {
     }
 
     pub fn set_duties(&mut self, d: Duties) {
-        let d = d.clamp01();
-        let max = self.max_duty as f32;
-        let ccr = |x: f32| (x * max).clamp(0.0, max) as u32;
-        self.inner.set_duty(Channel::Ch1, ccr(d.a));
-        self.inner.set_duty(Channel::Ch2, ccr(d.b));
-        self.inner.set_duty(Channel::Ch3, ccr(d.c));
-        self.set_ch4_sample(d);
+        self.apply(d);
     }
 
     /// PWM2 CCR4: mid-PWM (`ARR−1`) or into the high-duty low-side window (122 `Tafter`/`Tbefore`).
@@ -182,5 +176,17 @@ impl MotorPwm {
             b: duty_01,
             c: duty_01,
         });
+    }
+}
+
+impl DutySink for MotorPwm {
+    fn apply(&mut self, d: Duties) {
+        let d = d.clamp01();
+        let max = self.max_duty as f32;
+        let ccr = |x: f32| (x * max).clamp(0.0, max) as u32;
+        self.inner.set_duty(Channel::Ch1, ccr(d.a));
+        self.inner.set_duty(Channel::Ch2, ccr(d.b));
+        self.inner.set_duty(Channel::Ch3, ccr(d.c));
+        self.set_ch4_sample(d);
     }
 }

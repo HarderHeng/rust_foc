@@ -2,7 +2,7 @@
 
 Embassy Rust FOC for **STM32G431CB** boards electrically compatible with ST B-G431B-ESC1. Pin map and electrical constants follow Cube project `122`.
 
-- Current loop at **20 kHz** (ADC JEOS ISR): Clarke/Park → PI → 122-style Vqd feed-forward → voltage circle → SVPWM.
+- Current loop at **20 kHz** (ADC JEOS ISR): Clarke/Park → PI → 122-style Vqd feed-forward → **Vd-priority** voltage limit → SVPWM.
 - Speed PI at **~1 kHz**; AS5600 on I2C1 (PB8/PB7).
 - Math lives in the `foc/` crate (`cargo htest`). Firmware re-exports it as `crate::foc`.
 

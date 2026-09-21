@@ -16,7 +16,7 @@ use embassy_stm32::Peri;
 use static_cell::StaticCell;
 
 use crate::bsp::config::{adc_to_amps, adc_to_temp_c, adc_to_vbus, SAMPLE_CENTER_MARGIN};
-use crate::foc::Duties;
+use crate::foc::{Duties, DutySink, PhaseAbc, PhaseCurrents};
 
 const VBUS_SAMPLE: SampleTime = SampleTime::CYCLES247_5;
 const NTC_SAMPLE: SampleTime = SampleTime::CYCLES47_5;
@@ -48,6 +48,16 @@ pub struct AnalogSample {
     pub iw_a: f32,
     pub vbus_v: f32,
     pub temp_c: f32,
+}
+
+impl PhaseCurrents for AnalogSample {
+    fn abc(&self) -> PhaseAbc {
+        PhaseAbc {
+            a: self.iu_a,
+            b: self.iv_a,
+            c: self.iw_a,
+        }
+    }
 }
 
 pub struct Analog {
@@ -248,9 +258,7 @@ impl Analog {
     /// After SVPWM: program JSQR for the next CH4 edge.
     /// `last_pair` is the pair the *next* JEOS must decode (conversion not yet taken).
     pub fn schedule_pair(&mut self, d: Duties) {
-        self.next_pair = pair_from_duties(d);
-        program_pair(self.next_pair);
-        self.last_pair = self.next_pair;
+        self.apply(d);
     }
     pub fn calibrate_offsets(&mut self) {
         route_opamp3(ShuntPair::Uv);
@@ -308,5 +316,13 @@ impl Analog {
         s.vbus_v = bus.vbus_v;
         s.temp_c = bus.temp_c;
         s
+    }
+}
+
+impl DutySink for Analog {
+    fn apply(&mut self, d: Duties) {
+        self.next_pair = pair_from_duties(d);
+        program_pair(self.next_pair);
+        self.last_pair = self.next_pair;
     }
 }

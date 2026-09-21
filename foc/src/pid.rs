@@ -251,6 +251,28 @@ impl Pid {
     }
 }
 
+impl crate::traits::Regulator for Pid {
+    fn reset(&mut self) {
+        Pid::reset(self);
+    }
+
+    fn set_gains(&mut self, kp: f32, ki: f32) {
+        Pid::set_gains(self, kp, ki, self.kd);
+    }
+
+    fn set_limits(&mut self, lo: f32, hi: f32) {
+        Pid::set_limits(self, lo, hi);
+    }
+
+    fn step(&mut self, error: f32, dt: f32) -> f32 {
+        Pid::step(self, error, dt)
+    }
+
+    fn track(&mut self, applied: f32) {
+        Pid::track(self, applied);
+    }
+}
+
 fn ordered(a: f32, b: f32) -> (f32, f32) {
     if a <= b {
         (a, b)

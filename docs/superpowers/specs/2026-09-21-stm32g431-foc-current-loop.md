@@ -56,7 +56,7 @@ AS5600 (I2C, ~1 kHz) ──interp θe──┐
                                   │
 Ia,Ib (,Ic) ─Clarke─Park(θe)─► Id,Iq
                                   │
-              id, iq ── PI ── Vπ ─ + Vff ─ circle ─ invPark ─ SVPWM ─ TIM1
+              id, iq ── PI ── Vπ ─ + Vff ─ Vd-priority ─ invPark ─ SVPWM ─ TIM1
                                   ▲
                      VBUS; PI.track(V − Vff) after circle
 ```
@@ -168,7 +168,7 @@ Embassy tasks must not take TIM1, ADC1/2, OPAMP1/2/3, or the ADC DMA channels us
 
 - Position loop
 - Sensorless observer (122 STO)
-- Field weakening / 122 Vd-priority circle
+- Field weakening (Id < 0 at high speed); voltage limit is already 122 Vd-priority
 - CAN / ST MCSDK interoperability
 - High-rate analog angle path
 

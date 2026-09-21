@@ -4,8 +4,9 @@
 use micromath::F32Ext;
 
 use super::pid::Pi;
-use super::svm::{max_modulation, svpwm};
-use super::transforms::{clarke_two_phase, inv_park, park};
+use super::svm::{Svpwm, VdPriority};
+use super::traits::{Modulator, PhaseCurrents, Regulator, VoltageLimiter};
+use super::transforms::{clarke, inv_park, park};
 use super::types::{Dq, Duties};
 
 /// 122-style d/q voltage feed-forward (`FF_VqdffComputation`).
@@ -36,16 +37,27 @@ pub fn dq_voltage_ff(iref: Dq, omega_e: f32, p: DqFf) -> Dq {
     }
 }
 
-pub struct CurrentLoop {
+/// `M` / `L` default to SVPWM + 122 Vd-priority so firmware can keep `CurrentLoop`.
+pub struct CurrentLoop<M = Svpwm, L = VdPriority> {
     pub id: Pi,
     pub iq: Pi,
+    pub modulator: M,
+    pub limiter: L,
 }
 
-impl CurrentLoop {
+impl CurrentLoop<Svpwm, VdPriority> {
     pub fn new(kp: f32, ki: f32, v_lim: f32) -> Self {
+        Self::new_with(Svpwm, VdPriority, kp, ki, v_lim)
+    }
+}
+
+impl<M, L> CurrentLoop<M, L> {
+    pub fn new_with(modulator: M, limiter: L, kp: f32, ki: f32, v_lim: f32) -> Self {
         Self {
             id: Pi::new(kp, ki, -v_lim, v_lim),
             iq: Pi::new(kp, ki, -v_lim, v_lim),
+            modulator,
+            limiter,
         }
     }
 
@@ -55,43 +67,48 @@ impl CurrentLoop {
     }
 
     pub fn set_gains(&mut self, kp: f32, ki: f32) {
-        self.id.kp = kp;
-        self.id.ki = ki;
-        self.iq.kp = kp;
-        self.iq.ki = ki;
+        Regulator::set_gains(&mut self.id, kp, ki);
+        Regulator::set_gains(&mut self.iq, kp, ki);
     }
+}
 
-    /// `ff` is added **after** the PIs (122 `FF_VqdConditioning`). Circle limit
+impl<M: Modulator, L: VoltageLimiter> CurrentLoop<M, L> {
+    /// `ff` is added **after** the PIs (122 `FF_VqdConditioning`). Voltage limit
     /// is applied here; each PI is told its remaining share via [`Pi::track`].
-    pub fn step(&mut self, ia: f32, ib: f32, refs: Dq, theta_e: f32, vbus: f32, dt: f32, ff: Dq) -> (Dq, Duties) {
-        let lim = max_modulation(vbus);
-        self.id.set_limits(-lim, lim);
-        self.iq.set_limits(-lim, lim);
+    pub fn step(
+        &mut self,
+        i: impl PhaseCurrents,
+        refs: Dq,
+        theta_e: f32,
+        vbus: f32,
+        dt: f32,
+        ff: Dq,
+    ) -> (Dq, Duties) {
+        let lim = self.modulator.voltage_limit(vbus);
+        Regulator::set_limits(&mut self.id, -lim, lim);
+        Regulator::set_limits(&mut self.iq, -lim, lim);
 
-        let meas = park(clarke_two_phase(ia, ib), theta_e);
-        let vd_pi = self.id.step(refs.d - meas.d, dt);
-        let vq_pi = self.iq.step(refs.q - meas.q, dt);
+        let meas = park(clarke(i.abc()), theta_e);
+        let vd_pi = Regulator::step(&mut self.id, refs.d - meas.d, dt);
+        let vq_pi = Regulator::step(&mut self.iq, refs.q - meas.q, dt);
 
-        let mut vd = vd_pi + ff.d;
-        let mut vq = vq_pi + ff.q;
+        let vd = vd_pi + ff.d;
+        let vq = vq_pi + ff.q;
+        let (vd, vq) = self.limiter.limit(vd, vq, lim);
 
-        let mag = (vd * vd + vq * vq).sqrt();
-        if mag > lim && mag > 1e-6 {
-            let s = lim / mag;
-            vd *= s;
-            vq *= s;
-            self.id.track(vd - ff.d);
-            self.iq.track(vq - ff.q);
+        if (vd - (vd_pi + ff.d)).abs() > 1e-9 || (vq - (vq_pi + ff.q)).abs() > 1e-9 {
+            Regulator::track(&mut self.id, vd - ff.d);
+            Regulator::track(&mut self.iq, vq - ff.q);
         }
 
-        let duties = svpwm(inv_park(Dq { d: vd, q: vq }, theta_e), vbus);
+        let duties = self.modulator.modulate(inv_park(Dq { d: vd, q: vq }, theta_e), vbus);
         (meas, duties)
     }
 }
 
 /// Open-loop voltage: fixed Vd/Vq, ramped electrical angle.
 pub fn openloop_voltage(vd: f32, vq: f32, theta_e: f32, vbus: f32) -> Duties {
-    svpwm(inv_park(Dq { d: vd, q: vq }, theta_e), vbus)
+    Svpwm.modulate(inv_park(Dq { d: vd, q: vq }, theta_e), vbus)
 }
 
 #[cfg(test)]
@@ -117,9 +134,23 @@ mod tests {
     fn circle_track_does_not_touch_pid_when_inside() {
         let mut l = CurrentLoop::new(1.0, 0.0, 20.0);
         let refs = Dq { d: 0.1, q: 0.0 };
-        let (_m, _) = l.step(0.0, 0.0, refs, 0.0, 24.0, 0.001, Dq::default());
+        let (_m, _) = l.step((0.0, 0.0), refs, 0.0, 24.0, 0.001, Dq::default());
         let i0 = l.id.integrator();
-        let (_m, _) = l.step(0.0, 0.0, refs, 0.0, 24.0, 0.001, Dq::default());
+        let (_m, _) = l.step((0.0, 0.0), refs, 0.0, 24.0, 0.001, Dq::default());
         assert!((l.id.integrator() - i0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn saturation_keeps_vd_clips_vq() {
+        let mut l = CurrentLoop::new(50.0, 0.0, 20.0);
+        let refs = Dq { d: 0.1, q: 20.0 };
+        let (_m, _) = l.step((0.0, 0.0), refs, 0.0, 24.0, 0.001, Dq::default());
+        let vmax = Svpwm.voltage_limit(24.0);
+        let vd = l.id.last_output();
+        let vq = l.iq.last_output();
+        assert!((vd - 5.0).abs() < 1e-3, "{vd}");
+        let qmax = (vmax * vmax - vd * vd).sqrt();
+        assert!(vq.abs() <= qmax + 1e-3, "{vq} > {qmax}");
+        assert!((vd * vd + vq * vq).sqrt() <= vmax + 1e-3);
     }
 }
