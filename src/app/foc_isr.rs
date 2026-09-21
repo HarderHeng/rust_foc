@@ -14,7 +14,8 @@ use crate::driver::pwm::with_pwm;
 use crate::foc::current::openloop_voltage;
 use crate::foc::transforms::{clarke, park, wrap_2pi};
 use crate::foc::{
-    CurrentLoop, DeadTime, Dq, DqFf, DutyMap, DutySink, PhaseCurrents, dq_voltage_ff, flux_from_ke_vrms_ll_krpm,
+    CurrentLoop, DeadTime, Dq, DqFf, DutyMap, DutySink, FfOff, PhaseCurrents, VoltageFeedforward,
+    flux_from_ke_vrms_ll_krpm,
 };
 
 static LOOP: StaticCell<CurrentLoop> = StaticCell::new();
@@ -102,19 +103,16 @@ fn step(s: AnalogSample) {
         },
     };
 
+    let omega_e = telemetry::enc_omega_mrad() as f32 / 1000.0 * f32::from(control::poles());
     let ff = if control::mode() == control::Mode::Align {
-        Dq::default()
+        FfOff.vdq(refs, omega_e)
     } else {
-        let omega_e = telemetry::enc_omega_mrad() as f32 / 1000.0 * f32::from(control::poles());
-        dq_voltage_ff(
-            refs,
-            omega_e,
-            DqFf {
-                ld: MOTOR_LS_H,
-                lq: MOTOR_LS_H,
-                flux: flux_from_ke_vrms_ll_krpm(MOTOR_KE_VRMS_PER_KRPM, f32::from(control::poles())),
-            },
-        )
+        DqFf {
+            ld: MOTOR_LS_H,
+            lq: MOTOR_LS_H,
+            flux: flux_from_ke_vrms_ll_krpm(MOTOR_KE_VRMS_PER_KRPM, f32::from(control::poles())),
+        }
+        .vdq(refs, omega_e)
     };
 
     let Some(duties) = with_loop(|l| {
@@ -129,8 +127,7 @@ fn step(s: AnalogSample) {
 }
 
 fn apply_duties(duties: crate::foc::Duties) {
-    let _ = with_pwm(|p| p.apply(duties));
-    let _ = crate::driver::analog::with_analog(|a| a.apply(duties));
+    let _ = with_pwm(|p| crate::driver::analog::with_analog(|a| (p, a).apply(duties)));
 }
 
 fn with_loop<R>(f: impl FnOnce(&mut CurrentLoop) -> R) -> Option<R> {

@@ -53,6 +53,11 @@ pub trait VoltageLimiter {
     fn limit(&self, vd: f32, vq: f32, vmax: f32) -> (f32, f32);
 }
 
+/// Plant voltage feed-forward. Formula lives in the impl, not in [`crate::pid::Pid`].
+pub trait VoltageFeedforward {
+    fn vdq(&self, iref: crate::types::Dq, omega_e: f32) -> crate::types::Dq;
+}
+
 /// PWM / sample-pair scheduling. Implemented on the board drivers.
 pub trait DutySink {
     fn apply(&mut self, duties: Duties);

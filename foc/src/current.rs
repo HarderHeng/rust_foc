@@ -1,15 +1,15 @@
-//! One PWM-period current loop (122 FOC: PI → Vqdff → circle → SVPWM).
+//! One PWM-period current loop (PI → feed-forward → limit → SVPWM).
 
 #[allow(unused_imports)]
 use micromath::F32Ext;
 
 use super::pid::Pi;
 use super::svm::{Svpwm, VdPriority};
-use super::traits::{Modulator, PhaseCurrents, Regulator, VoltageLimiter};
+use super::traits::{Modulator, PhaseCurrents, Regulator, VoltageFeedforward, VoltageLimiter};
 use super::transforms::{clarke, inv_park, park};
 use super::types::{Dq, Duties};
 
-/// 122-style d/q voltage feed-forward (`FF_VqdffComputation`).
+/// PMSM d/q voltage feed-forward (ST MCWB `FF_VqdffComputation`).
 ///
 /// `vd_ff = −ωe·Lq·iq`, `vq_ff = ωe·Ld·id + ωe·ψf` (uses **references**, SI volts).
 #[derive(Clone, Copy)]
@@ -37,43 +37,66 @@ pub fn dq_voltage_ff(iref: Dq, omega_e: f32, p: DqFf) -> Dq {
     }
 }
 
-/// `M` / `L` default to SVPWM + 122 Vd-priority so firmware can keep `CurrentLoop`.
-pub struct CurrentLoop<M = Svpwm, L = VdPriority> {
-    pub id: Pi,
-    pub iq: Pi,
+/// No decoupling / BEMF term.
+#[derive(Clone, Copy, Default)]
+pub struct FfOff;
+
+impl VoltageFeedforward for FfOff {
+    fn vdq(&self, _iref: Dq, _omega_e: f32) -> Dq {
+        Dq::default()
+    }
+}
+
+impl VoltageFeedforward for DqFf {
+    fn vdq(&self, iref: Dq, omega_e: f32) -> Dq {
+        dq_voltage_ff(iref, omega_e, *self)
+    }
+}
+
+/// Defaults: PI + SVPWM + Vd-priority (ST MCWB-style).
+pub struct CurrentLoop<R = Pi, M = Svpwm, L = VdPriority> {
+    pub id: R,
+    pub iq: R,
     pub modulator: M,
     pub limiter: L,
 }
 
-impl CurrentLoop<Svpwm, VdPriority> {
+impl CurrentLoop {
     pub fn new(kp: f32, ki: f32, v_lim: f32) -> Self {
-        Self::new_with(Svpwm, VdPriority, kp, ki, v_lim)
+        Self::new_with(
+            Pi::new(kp, ki, -v_lim, v_lim),
+            Pi::new(kp, ki, -v_lim, v_lim),
+            Svpwm,
+            VdPriority,
+        )
     }
 }
 
-impl<M, L> CurrentLoop<M, L> {
-    pub fn new_with(modulator: M, limiter: L, kp: f32, ki: f32, v_lim: f32) -> Self {
+impl<R, M, L> CurrentLoop<R, M, L> {
+    pub fn new_with(id: R, iq: R, modulator: M, limiter: L) -> Self {
         Self {
-            id: Pi::new(kp, ki, -v_lim, v_lim),
-            iq: Pi::new(kp, ki, -v_lim, v_lim),
+            id,
+            iq,
             modulator,
             limiter,
         }
     }
+}
 
+impl<R: Regulator, M, L> CurrentLoop<R, M, L> {
     pub fn reset(&mut self) {
         self.id.reset();
         self.iq.reset();
     }
 
     pub fn set_gains(&mut self, kp: f32, ki: f32) {
-        Regulator::set_gains(&mut self.id, kp, ki);
-        Regulator::set_gains(&mut self.iq, kp, ki);
+        self.id.set_gains(kp, ki);
+        self.iq.set_gains(kp, ki);
     }
 }
 
-impl<M: Modulator, L: VoltageLimiter> CurrentLoop<M, L> {
-    /// `ff` is added **after** the PIs (122 `FF_VqdConditioning`). Voltage limit
+impl<R: Regulator, M: Modulator, L: VoltageLimiter> CurrentLoop<R, M, L> {
+    /// `ff` is added **after** the regulators (ST MCWB `FF_VqdConditioning`). Voltage limit
     /// is applied here; each PI is told its remaining share via [`Pi::track`].
     pub fn step(
         &mut self,
@@ -117,17 +140,16 @@ mod tests {
 
     #[test]
     fn ff_is_minus_cross_coupling() {
-        let ff = dq_voltage_ff(
-            Dq { d: 0.0, q: 2.0 },
-            100.0,
-            DqFf {
-                ld: 0.001,
-                lq: 0.001,
-                flux: 0.0,
-            },
-        );
+        let p = DqFf {
+            ld: 0.001,
+            lq: 0.001,
+            flux: 0.0,
+        };
+        let ff = p.vdq(Dq { d: 0.0, q: 2.0 }, 100.0);
         assert!((ff.d - (-0.2)).abs() < 1e-5);
         assert!(ff.q.abs() < 1e-5);
+        let off = FfOff.vdq(Dq { d: 0.0, q: 2.0 }, 100.0);
+        assert!(off.d.abs() < 1e-9 && off.q.abs() < 1e-9);
     }
 
     #[test]

@@ -65,7 +65,7 @@ Ia,Ib (,Ic) ─Clarke─Park(θe)─► Id,Iq
 - **Current sense**: R3_2 two-phase pair each PWM. OPAMP3 `OPAINTOEN` on for UW (ADC2 CH18), off for UV/VW (PB1 / ADC1 IN12).
 - **Current loop**: 20 kHz, ADC1 JEOS (not an Embassy task).
 - **Pid**: portable parallel PI/PID; clamps its own output; `track(applied)` for outer limits. No motor model, no voltage circle inside Pid.
-- **Vqd feed-forward** (122 `FF_VqdffComputation`, after PI): `vd_ff = −ωe·Lq·iq*`, `vq_ff = ωe·Ld·id* + ωe·ψf` (`Ld=Lq=LS`, `ψf` from `Ke`).
+- **Vqd feed-forward** (`VoltageFeedforward`: `FfOff` / `DqFf`, after PI): `vd_ff = −ωe·Lq·iq*`, `vq_ff = ωe·Ld·id* + ωe·ψf` (`Ld=Lq=LS`, `ψf` from `Ke`). Align uses `FfOff`.
 - **Angle**: AS5600 at ~1 kHz; ISR interpolates `θm + ωm·dt`. Invalid encoder: hold last CCR; trip after grace in Run/Speed.
 - **Align**: `foc align [mA]` — hold `id` (default 500 mA), `iq=0`, `θe=0` for 500 ms, latch `θ_offset`, coast to Idle. Encoder invalid → `fault=enc`.
 - **Ramps** (~1 kHz): Id/Iq 10 A/s in Align/Run; rpm 6420 rpm/s in Speed, starting from measured rpm.
@@ -89,8 +89,9 @@ cnt  __/‾‾‾‾‾‾‾\______/‾‾‾‾
 ```
 foc/                         # no_std math; `cargo htest`
 ├── pid.rs                   # Pid + track; Pi alias
+├── traits.rs                # Regulator, Modulator, VoltageLimiter, VoltageFeedforward, DutySink
 ├── slew.rs                  # reference rate limit
-├── current.rs               # PI → Vff → circle → SVPWM
+├── current.rs               # CurrentLoop<R,M,L>: PI → Vff → Vd-priority → SVPWM
 ├── speed.rs / svm / transforms / types
 src/
 ├── bin/main/                # Embassy: shell, encoder, analog, button
