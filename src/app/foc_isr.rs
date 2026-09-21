@@ -6,8 +6,8 @@ use static_cell::StaticCell;
 
 use crate::app::{control, telemetry};
 use crate::bsp::config::{
-    CURRENT_KI, CURRENT_KP, CURRENT_LOOP_TS, DEADTIME_DUTY, DEFAULT_POLE_PAIRS, MOTOR_KE_VRMS_PER_KRPM, MOTOR_LS_H,
-    NOMINAL_VBUS_V, SW_OCP_A,
+    CURRENT_KI, CURRENT_KP, CURRENT_LOOP_TS, DEADTIME_DUTY, MOTOR_KE_VRMS_PER_KRPM, MOTOR_LS_H, NOMINAL_VBUS_V,
+    SW_OCP_A,
 };
 use crate::foc::svm::compensate_deadtime;
 use crate::driver::analog::AnalogSample;
@@ -82,6 +82,9 @@ fn openloop_step(s: AnalogSample) {
 }
 
 fn step(s: AnalogSample) {
+    if telemetry::vbus_mv() == 0 {
+        return;
+    }
     let vbus = vbus_v();
 
     let theta_e = if control::mode() == control::Mode::Align {
@@ -105,16 +108,20 @@ fn step(s: AnalogSample) {
         },
     };
 
-    let omega_e = telemetry::enc_omega_mrad() as f32 / 1000.0 * f32::from(control::poles());
-    let ff = dq_voltage_ff(
-        refs,
-        omega_e,
-        DqFf {
-            ld: MOTOR_LS_H,
-            lq: MOTOR_LS_H,
-            flux: flux_from_ke_vrms_ll_krpm(MOTOR_KE_VRMS_PER_KRPM, f32::from(DEFAULT_POLE_PAIRS)),
-        },
-    );
+    let ff = if control::mode() == control::Mode::Align {
+        Dq::default()
+    } else {
+        let omega_e = telemetry::enc_omega_mrad() as f32 / 1000.0 * f32::from(control::poles());
+        dq_voltage_ff(
+            refs,
+            omega_e,
+            DqFf {
+                ld: MOTOR_LS_H,
+                lq: MOTOR_LS_H,
+                flux: flux_from_ke_vrms_ll_krpm(MOTOR_KE_VRMS_PER_KRPM, f32::from(control::poles())),
+            },
+        )
+    };
 
     let Some(duties) = with_loop(|l| {
         let (meas, duties) = l.step(s.iu_a, s.iv_a, refs, theta_e, vbus, CURRENT_LOOP_TS, ff);

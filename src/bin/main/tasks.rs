@@ -72,9 +72,11 @@ pub async fn analog_task() {
             } else if control::cmd_timed_out() {
                 control::fault(control::FaultKind::CmdTimeout);
             }
+        } else if control::cmd_timed_out() {
+            control::fault(control::FaultKind::CmdTimeout);
         }
-        control::poll_align();
         control::poll_refs();
+        control::poll_align();
         Timer::after_millis(1).await;
     }
 }

@@ -1,7 +1,7 @@
 //! Runtime mode and references. Embassy and the current ISR share this.
 //! Hardware enable/duty go through here only — not through the shell.
 
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 
 use embassy_time::{Duration, Instant};
 
@@ -117,6 +117,7 @@ static SPD_KI: AtomicU32 = AtomicU32::new(0);
 static LAST_FAULT: AtomicU8 = AtomicU8::new(FaultKind::None as u8);
 static LAST_CMD_TICKS: AtomicU32 = AtomicU32::new(0);
 static ALIGN_START_TICKS: AtomicU32 = AtomicU32::new(0);
+static ALIGN_HOLDING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 pub struct Snapshot {
@@ -193,6 +194,8 @@ pub fn start_speed(rpm: i32) {
     let tgt = rpm.clamp(-lim, lim);
     RPM_TGT.store(tgt, Ordering::Relaxed);
     RPM_REF.store(telemetry::rpm_meas().clamp(-lim, lim), Ordering::Relaxed);
+    ID_TGT_MA.store(0, Ordering::Relaxed);
+    ID_MA.store(0, Ordering::Relaxed);
     LAST_FAULT.store(FaultKind::None as u8, Ordering::Relaxed);
     touch_cmd();
     speed_loop::reset();
@@ -249,13 +252,15 @@ pub fn touch_cmd() {
     LAST_CMD_TICKS.store(Instant::now().as_ticks() as u32, Ordering::Relaxed);
 }
 
-/// Run / Speed only: no new command for [`CMD_TIMEOUT_MS`].
+/// Run with a non-zero Id/Iq target: trip if the operator goes silent.
+/// Speed keeps `rpm` as a standing command (no timeout).
 pub fn cmd_timed_out() -> bool {
-    if !matches!(mode(), Mode::Run | Mode::Speed) {
+    if mode() != Mode::Run || (id_target_ma() == 0 && iq_target_ma() == 0) {
         return false;
     }
+    let now = Instant::now().as_ticks() as u32;
     let last = LAST_CMD_TICKS.load(Ordering::Relaxed);
-    Instant::from_ticks(u64::from(last)).elapsed() > Duration::from_millis(u64::from(CMD_TIMEOUT_MS))
+    Duration::from_ticks(u64::from(now.wrapping_sub(last))) > Duration::from_millis(u64::from(CMD_TIMEOUT_MS))
 }
 
 /// Blocking regular-ADC offset. PWM must be off.
@@ -266,16 +271,19 @@ pub fn calibrate_offsets() -> bool {
     analog::recalibrate()
 }
 
-/// Hold D-axis current with θe=0 for [`ALIGN_MS`], then latch encoder as offset and coast.
+/// Hold D-axis current with θe=0 for [`ALIGN_MS`] *after Id arrives*, then latch offset.
 pub fn request_align(id_ma: Option<i32>) {
     if mode() == Mode::Fault {
         return;
+    }
+    if outputs_live() && mode() != Mode::Align {
+        stop();
     }
     let id = id_ma.unwrap_or(ALIGN_ID_MA).clamp(1, MAX_CURRENT_MA);
     ID_TGT_MA.store(id, Ordering::Relaxed);
     IQ_TGT_MA.store(0, Ordering::Relaxed);
     IQ_MA.store(0, Ordering::Relaxed);
-    ALIGN_START_TICKS.store(Instant::now().as_ticks() as u32, Ordering::Relaxed);
+    ALIGN_HOLDING.store(false, Ordering::Relaxed);
     LAST_FAULT.store(FaultKind::None as u8, Ordering::Relaxed);
     touch_cmd();
     foc_isr::reset();
@@ -288,19 +296,29 @@ pub fn poll_align() {
     if mode() != Mode::Align {
         return;
     }
-    if align_left_ms() > 0 {
+    if !ALIGN_HOLDING.load(Ordering::Relaxed) {
+        if (id_ma() - ID_TGT_MA.load(Ordering::Relaxed)).unsigned_abs() <= 2 {
+            ALIGN_HOLDING.store(true, Ordering::Relaxed);
+            ALIGN_START_TICKS.store(Instant::now().as_ticks() as u32, Ordering::Relaxed);
+        }
         return;
     }
-    finish_align();
+    if align_left_ms() == 0 {
+        finish_align();
+    }
 }
 
 pub fn align_left_ms() -> u32 {
     if mode() != Mode::Align {
         return 0;
     }
-    let start = Instant::from_ticks(u64::from(ALIGN_START_TICKS.load(Ordering::Relaxed)));
-    let gone = start.elapsed().as_millis() as u32;
-    ALIGN_MS.saturating_sub(gone)
+    if !ALIGN_HOLDING.load(Ordering::Relaxed) {
+        return ALIGN_MS;
+    }
+    let start = ALIGN_START_TICKS.load(Ordering::Relaxed);
+    let now = Instant::now().as_ticks() as u32;
+    let gone_ms = Duration::from_ticks(u64::from(now.wrapping_sub(start))).as_millis() as u32;
+    ALIGN_MS.saturating_sub(gone_ms)
 }
 
 fn finish_align() {

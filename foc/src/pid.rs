@@ -158,6 +158,7 @@ impl Pid {
     /// `applied` is this regulator's share only (command minus any feed-forward
     /// the caller added). Voltage circle / SVM stay in the caller.
     pub fn track(&mut self, applied: f32) {
+        let applied = applied.clamp(self.out_min, self.out_max);
         if let AntiWindup::BackCalc { kaw } = self.anti_windup {
             self.integ += kaw * (applied - self.last_out);
         }
@@ -318,6 +319,15 @@ mod tests {
         p.track(0.3);
         close(p.last_output(), 0.3);
         close(p.integrator(), i0 - 0.7);
+    }
+
+    #[test]
+    fn track_clamps_to_limits() {
+        let mut p = Pid::pi(0.0, 0.0, -1.0, 1.0);
+        let _ = p.step(0.0, 0.001);
+        p.track(8.0);
+        close(p.last_output(), 1.0);
+        close(p.integrator(), 1.0);
     }
 
     #[test]
