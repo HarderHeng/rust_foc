@@ -1,5 +1,16 @@
 {
+  "rust-analyzer.cargo.target": "thumbv7em-none-eabihf",
   "rust-analyzer.cargo.allTargets": false,
+  "rust-analyzer.cfg.setTest": false,
   "rust-analyzer.check.allTargets": false,
-  "rust-analyzer.cargo.target": "thumbv7em-none-eabihf"
+  "rust-analyzer.check.extraArgs": ["--lib", "--bins"],
+  "rust-analyzer.check.overrideCommand": [
+    "cargo",
+    "check",
+    "--message-format=json",
+    "--target",
+    "thumbv7em-none-eabihf",
+    "--lib",
+    "--bins"
+  ]
 }

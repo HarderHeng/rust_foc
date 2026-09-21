@@ -1,6 +1,5 @@
 //! One PWM-period current loop.
 
-#[cfg(not(test))]
 use micromath::F32Ext;
 
 use super::pid::Pi;
@@ -24,6 +23,13 @@ impl CurrentLoop {
     pub fn reset(&mut self) {
         self.id.reset();
         self.iq.reset();
+    }
+
+    pub fn set_gains(&mut self, kp: f32, ki: f32) {
+        self.id.kp = kp;
+        self.id.ki = ki;
+        self.iq.kp = kp;
+        self.iq.ki = ki;
     }
 
     pub fn step(&mut self, ia: f32, ib: f32, refs: Dq, theta_e: f32, vbus: f32, dt: f32) -> (Dq, Duties) {

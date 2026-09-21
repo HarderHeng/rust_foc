@@ -4,6 +4,18 @@ name = "stm32g431-foc"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
 
+# Thumb has no libtest/std. rust-analyzer --all-targets must not build tests.
+[lib]
+test = false
+doctest = false
+bench = false
+
+[[bin]]
+name = "main"
+path = "src/bin/main/main.rs"
+test = false
+bench = false
+
 [dependencies]
 cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7.3"

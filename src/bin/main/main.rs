@@ -23,6 +23,8 @@ async fn main(spawner: Spawner) {
     spawner.spawn(unwrap!(tasks::shell_task(board.uart_rx, board.uart_tx, board.led)));
     spawner.spawn(unwrap!(tasks::heartbeat_task(board.led)));
     spawner.spawn(unwrap!(tasks::encoder_task(board.encoder)));
+    spawner.spawn(unwrap!(tasks::analog_task()));
+    spawner.spawn(unwrap!(tasks::button_task(board.button)));
 
     defmt::info!("All tasks started");
 }

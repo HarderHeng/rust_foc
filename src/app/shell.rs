@@ -1,35 +1,33 @@
-//! Async line shell over USART2. No embedded-cli, no block_on.
+//! USART2 line editor. Talks to `app::control` / telemetry, not to PWM.
 
 use embassy_stm32::mode::Async;
 use embassy_stm32::usart::{RingBufferedUartRx, UartTx};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::mutex::Mutex;
 use embassy_time::Timer;
 
-use crate::app;
-use crate::driver::led::Led;
-use crate::driver::pwm::with_pwm;
+use crate::app::{self, control};
+use crate::driver::led::LedHandle;
 
 const LINE_CAP: usize = 64;
 const HIST_CAP: usize = 8;
 const PROMPT: &[u8] = b"G431> ";
 
 const ROOT_CMDS: &[&str] = &[
-    "help", "?", "hello", "clear", "version", "echo", "led", "system", "enc", "foc",
+    "help", "?", "hello", "clear", "version", "echo", "led", "system", "enc", "adc", "foc",
 ];
 const LED_SUB: &[&str] = &["on", "off", "toggle"];
 const SYSTEM_SUB: &[&str] = &["info"];
-const FOC_SUB: &[&str] = &["status", "start", "stop", "align", "id", "iq", "poles", "pwm"];
+const FOC_SUB: &[&str] = &[
+    "status", "start", "stop", "align", "id", "iq", "poles", "pwm", "offset", "zero", "openloop", "rpm", "kp",
+    "ki", "skp", "ski",
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Esc {
     None,
-    Esc,
+    Lead,
     Csi,
     Ss3,
 }
-
-pub type LedHandle = Mutex<CriticalSectionRawMutex, Led>;
 
 pub struct Shell {
     tx: UartTx<'static, Async>,
@@ -39,14 +37,11 @@ pub struct Shell {
     hist_len: [usize; HIST_CAP],
     hist_head: usize,
     hist_count: usize,
-    /// `None` = editing draft; `Some(0)` = newest history entry.
     hist_nav: Option<usize>,
     draft: [u8; LINE_CAP],
     draft_len: usize,
     esc: Esc,
-    /// Drop a LF that follows CR so Windows `\r\n` submits once.
     skip_lf: bool,
-    /// Visible line width last drawn (for erase without relying on CSI).
     painted: usize,
 }
 
@@ -98,7 +93,7 @@ impl Shell {
 
         match self.esc {
             Esc::None => {}
-            Esc::Esc => {
+            Esc::Lead => {
                 self.esc = match b {
                     b'[' => Esc::Csi,
                     b'O' => Esc::Ss3,
@@ -107,7 +102,6 @@ impl Shell {
                 if self.esc != Esc::None {
                     return;
                 }
-                // Lone ESC then a real key: keep the key.
             }
             Esc::Csi => {
                 if matches!(b, b'0'..=b'9' | b';' | b'?') {
@@ -133,9 +127,8 @@ impl Shell {
         }
 
         match b {
-            0x1b => self.esc = Esc::Esc,
+            0x1b => self.esc = Esc::Lead,
             0x03 => {
-                // Ctrl-C: abandon line
                 self.hist_nav = None;
                 self.len = 0;
                 self.painted = 0;
@@ -143,7 +136,6 @@ impl Shell {
                 let _ = self.write_all(PROMPT).await;
             }
             0x15 => {
-                // Ctrl-U: kill to start
                 self.hist_nav = None;
                 self.len = 0;
                 self.redraw_line().await;
@@ -323,11 +315,11 @@ impl Shell {
 
         if n > 1 {
             let _ = self.write_all(b"\r\n").await;
-            for i in 0..n {
+            for (i, word) in matches[..n].iter().enumerate() {
                 if i > 0 {
                     let _ = self.write_all(b" ").await;
                 }
-                let _ = self.write_all(matches[i].as_bytes()).await;
+                let _ = self.write_all(word.as_bytes()).await;
             }
             let _ = self.write_all(b"\r\n").await;
             self.redraw_line().await;
@@ -344,8 +336,9 @@ impl Shell {
             "help" | "?" => {
                 let _ = self.write_all(
                     b"help | hello [name] | clear | version | echo [text]\r\n\
-                      led on|off|toggle | system info | enc\r\n\
+                      led on|off|toggle | system info | enc | adc\r\n\
                       foc status|start|stop|align|id <mA>|iq <mA>|poles <n>|pwm <%>\r\n\
+                      foc kp|ki|skp|ski [x] | rpm <n> | openloop <vq_mV> <Hz>\r\n\
                       Tab: complete   Up/Down: history   Ctrl-C/U: abort/kill\r\n",
                 )
                 .await;
@@ -409,6 +402,25 @@ impl Shell {
                 let _ = self.write_all(ok.as_bytes()).await;
                 let _ = self.write_all(b"\r\n").await;
             }
+            "adc" => {
+                let _ = self.write_all(b"iu=").await;
+                let _ = self.write_i32(app::iu_ma() as i32).await;
+                let _ = self.write_all(b" iv=").await;
+                let _ = self.write_i32(app::iv_ma() as i32).await;
+                let _ = self.write_all(b" iw=").await;
+                let _ = self.write_i32(app::iw_ma() as i32).await;
+                let _ = self.write_all(b" mA  vbus=").await;
+                let _ = self.write_i32(app::vbus_mv() as i32).await;
+                let _ = self.write_all(b" mV  t=").await;
+                let _ = self.write_i32(app::temp_c10() as i32).await;
+                let _ = self.write_all(b" (0.1C) raw ").await;
+                let _ = self.write_i32(app::iu_raw() as i32).await;
+                let _ = self.write_all(b" ").await;
+                let _ = self.write_i32(app::iv_raw() as i32).await;
+                let _ = self.write_all(b" ").await;
+                let _ = self.write_i32(app::iw_raw() as i32).await;
+                let _ = self.write_all(b"\r\n").await;
+            }
             "foc" => self.cmd_foc(&mut toks).await,
             _ => {
                 let _ = self.write_all(b"unknown: ").await;
@@ -421,38 +433,54 @@ impl Shell {
     async fn cmd_foc(&mut self, toks: &mut core::str::SplitWhitespace<'_>) {
         match toks.next() {
             Some("status") => {
-                let on = if app::enabled() { "on" } else { "off" };
+                let s = control::snapshot();
                 let _ = self.write_all(b"foc ").await;
-                let _ = self.write_all(on.as_bytes()).await;
+                let _ = self.write_all(s.mode.as_str().as_bytes()).await;
                 let _ = self.write_all(b" id_ma=").await;
-                let _ = self.write_i32(app::id_ma()).await;
+                let _ = self.write_i32(s.id_ma).await;
                 let _ = self.write_all(b" iq_ma=").await;
-                let _ = self.write_i32(app::iq_ma()).await;
+                let _ = self.write_i32(s.iq_ma).await;
                 let _ = self.write_all(b" poles=").await;
-                let _ = self.write_i32(app::poles() as i32).await;
+                let _ = self.write_i32(s.poles as i32).await;
                 let _ = self.write_all(b" pwm=").await;
-                let _ = self.write_i32(app::pwm_pct() as i32).await;
-                let _ = self.write_all(b"%\r\n").await;
+                let _ = self.write_i32(s.pwm_pct as i32).await;
+                let _ = self.write_all(b"% id=").await;
+                let _ = self.write_i32(app::id_meas_ma() as i32).await;
+                let _ = self.write_all(b" iq=").await;
+                let _ = self.write_i32(app::iq_meas_ma() as i32).await;
+                let _ = self.write_all(b" mA off=").await;
+                let _ = self.write_i32(control::theta_e_off_mrad()).await;
+                let _ = self.write_all(b" mrad rpm=").await;
+                let _ = self.write_i32(app::rpm_meas()).await;
+                let _ = self.write_all(b"/").await;
+                let _ = self.write_i32(control::rpm_ref()).await;
+                let _ = self.write_all(b"\r\n").await;
             }
             Some("start") => {
-                app::set_enable(true);
-                let _ = with_pwm(|p| p.enable());
-                let _ = self.write_all(b"PWM outputs ON\r\n").await;
+                if control::mode() == control::Mode::Fault {
+                    let _ = self.write_all(b"blocked: fault (foc stop)\r\n").await;
+                } else {
+                    control::start();
+                    let _ = self.write_all(b"current loop ON\r\n").await;
+                }
             }
             Some("stop") => {
-                app::set_enable(false);
-                let _ = with_pwm(|p| p.disable());
+                control::stop();
                 let _ = self.write_all(b"PWM outputs OFF\r\n").await;
             }
             Some("align") => {
-                app::request_align();
-                let _ = self.write_all(b"align requested\r\n").await;
+                if control::mode() == control::Mode::Fault {
+                    let _ = self.write_all(b"blocked: fault (foc stop)\r\n").await;
+                } else {
+                    control::request_align();
+                    let _ = self.write_all(b"align requested\r\n").await;
+                }
             }
             Some("id") => match parse_i32(toks.next()) {
                 Some(ma) => {
-                    app::set_id_ma(ma);
+                    control::set_id_ma(ma);
                     let _ = self.write_all(b"id_ref=").await;
-                    let _ = self.write_i32(app::id_ma()).await;
+                    let _ = self.write_i32(control::id_ma()).await;
                     let _ = self.write_all(b" mA\r\n").await;
                 }
                 None => {
@@ -461,9 +489,9 @@ impl Shell {
             },
             Some("iq") => match parse_i32(toks.next()) {
                 Some(ma) => {
-                    app::set_iq_ma(ma);
+                    control::set_iq_ma(ma);
                     let _ = self.write_all(b"iq_ref=").await;
-                    let _ = self.write_i32(app::iq_ma()).await;
+                    let _ = self.write_i32(control::iq_ma()).await;
                     let _ = self.write_all(b" mA\r\n").await;
                 }
                 None => {
@@ -472,21 +500,84 @@ impl Shell {
             },
             Some("poles") => match parse_u8(toks.next()) {
                 Some(n) => {
-                    app::set_poles(n);
+                    control::set_poles(n);
                     let _ = self.write_all(b"poles=").await;
-                    let _ = self.write_i32(app::poles() as i32).await;
+                    let _ = self.write_i32(control::poles() as i32).await;
                     let _ = self.write_all(b"\r\n").await;
                 }
                 None => {
                     let _ = self.write_all(b"usage: foc poles <n>\r\n").await;
                 }
             },
+            Some("offset") => match toks.next() {
+                None => {
+                    let _ = self.write_all(b"theta_e_off=").await;
+                    let _ = self.write_i32(control::theta_e_off_mrad()).await;
+                    let _ = self.write_all(b" mrad\r\n").await;
+                }
+                Some(s) => match parse_i32(Some(s)) {
+                    Some(mrad) => {
+                        control::set_theta_e_off_mrad(mrad);
+                        let _ = self.write_all(b"theta_e_off=").await;
+                        let _ = self.write_i32(control::theta_e_off_mrad()).await;
+                        let _ = self.write_all(b" mrad\r\n").await;
+                    }
+                    None => {
+                        let _ = self.write_all(b"usage: foc offset [mrad]\r\n").await;
+                    }
+                },
+            },
+            Some("rpm") => match parse_i32(toks.next()) {
+                Some(rpm) => {
+                    if control::mode() == control::Mode::Fault {
+                        let _ = self.write_all(b"blocked: fault (foc stop)\r\n").await;
+                    } else {
+                        control::start_speed(rpm);
+                        let _ = self.write_all(b"speed rpm_ref=").await;
+                        let _ = self.write_i32(control::rpm_ref()).await;
+                        let _ = self.write_all(b"\r\n").await;
+                    }
+                }
+                None => {
+                    let _ = self.write_all(b"rpm=").await;
+                    let _ = self.write_i32(app::rpm_meas()).await;
+                    let _ = self.write_all(b"  ref=").await;
+                    let _ = self.write_i32(control::rpm_ref()).await;
+                    let _ = self.write_all(b"\r\n").await;
+                }
+            },
+            Some("openloop") => match (parse_i32(toks.next()), parse_u8(toks.next())) {
+                (Some(vq_mv), Some(hz)) => {
+                    if control::mode() == control::Mode::Fault {
+                        let _ = self.write_all(b"blocked: fault (foc stop)\r\n").await;
+                    } else {
+                        control::start_openloop(vq_mv, hz);
+                        let _ = self.write_all(b"openloop vq=").await;
+                        let _ = self.write_i32(control::ol_vq_mv()).await;
+                        let _ = self.write_all(b" mV  ").await;
+                        let _ = self.write_i32(control::ol_hz() as i32).await;
+                        let _ = self.write_all(b" Hz\r\n").await;
+                    }
+                }
+                _ => {
+                    let _ = self.write_all(b"usage: foc openloop <vq_mV> <Hz>\r\n").await;
+                }
+            },
+            Some("kp") => self.cmd_gain("kp", toks.next(), true, true).await,
+            Some("ki") => self.cmd_gain("ki", toks.next(), true, false).await,
+            Some("skp") => self.cmd_gain("skp", toks.next(), false, true).await,
+            Some("ski") => self.cmd_gain("ski", toks.next(), false, false).await,
+            Some("zero") => {
+                control::capture_electrical_offset();
+                let _ = self.write_all(b"theta_e_off=").await;
+                let _ = self.write_i32(control::theta_e_off_mrad()).await;
+                let _ = self.write_all(b" mrad\r\n").await;
+            }
             Some("pwm") => match parse_u8(toks.next()) {
                 Some(pct) => {
-                    app::set_pwm_pct(pct);
-                    let _ = with_pwm(|p| p.set_duty_all(app::pwm_pct() as f32 / 100.0));
+                    control::set_pwm_pct(pct);
                     let _ = self.write_all(b"duty=").await;
-                    let _ = self.write_i32(app::pwm_pct() as i32).await;
+                    let _ = self.write_i32(control::pwm_pct() as i32).await;
                     let _ = self.write_all(b"%\r\n").await;
                 }
                 None => {
@@ -494,9 +585,42 @@ impl Shell {
                 }
             },
             _ => {
-                let _ = self.write_all(b"usage: foc status|start|stop|align|id|iq|poles|pwm\r\n").await;
+                let _ = self.write_all(b"usage: foc status|start|stop|align|id|iq|poles|pwm|offset|zero|openloop|rpm|kp|ki|skp|ski\r\n").await;
             }
         }
+    }
+
+    async fn cmd_gain(&mut self, name: &str, arg: Option<&str>, current: bool, is_kp: bool) {
+        if let Some(v) = parse_f32(arg) {
+            if current {
+                let (kp, ki) = if is_kp {
+                    (v, control::current_ki())
+                } else {
+                    (control::current_kp(), v)
+                };
+                control::set_current_gains(kp, ki);
+            } else {
+                let (kp, ki) = if is_kp {
+                    (v, control::speed_ki())
+                } else {
+                    (control::speed_kp(), v)
+                };
+                control::set_speed_gains(kp, ki);
+            }
+        } else if arg.is_some() {
+            let _ = self.write_all(b"usage: foc kp|ki|skp|ski [value]\r\n").await;
+            return;
+        }
+        let _ = self.write_all(name.as_bytes()).await;
+        let _ = self.write_all(b"=").await;
+        let val = match name {
+            "kp" => control::current_kp(),
+            "ki" => control::current_ki(),
+            "skp" => control::speed_kp(),
+            _ => control::speed_ki(),
+        };
+        let _ = self.write_f32(val).await;
+        let _ = self.write_all(b"\r\n").await;
     }
 
     async fn write_all(&mut self, buf: &[u8]) -> Result<(), ()> {
@@ -508,9 +632,28 @@ impl Shell {
         let n = fmt_i32(v, &mut buf);
         self.write_all(&buf[..n]).await
     }
+
+    async fn write_f32(&mut self, v: f32) -> Result<(), ()> {
+        let neg = v < 0.0;
+        let v = if neg { -v } else { v };
+        let ip = v as i32;
+        let frac = ((v - ip as f32) * 1000.0) as i32;
+        if neg {
+            self.write_all(b"-").await?;
+        }
+        self.write_i32(ip).await?;
+        self.write_all(b".").await?;
+        let mut d = [b'0'; 3];
+        let mut f = frac.clamp(0, 999);
+        d[2] = b'0' + (f % 10) as u8;
+        f /= 10;
+        d[1] = b'0' + (f % 10) as u8;
+        f /= 10;
+        d[0] = b'0' + (f % 10) as u8;
+        self.write_all(&d).await
+    }
 }
 
-/// Last token being typed, and the word list to complete against.
 fn completion_words(line: &str) -> Option<(&str, &'static [&'static str])> {
     let ends_space = line.ends_with(' ');
     let mut parts = line.split_whitespace();
@@ -573,7 +716,6 @@ fn maybe_space_after(line: &mut [u8; LINE_CAP], len: &mut usize, word: &str) {
     }
 }
 
-/// After CR, the following LF must not submit again.
 fn drop_crlf_lf(skip_lf: &mut bool, b: u8) -> bool {
     if *skip_lf {
         *skip_lf = false;
@@ -592,6 +734,38 @@ fn parse_i32(s: Option<&str>) -> Option<i32> {
 
 fn parse_u8(s: Option<&str>) -> Option<u8> {
     s.and_then(|t| t.parse().ok())
+}
+
+fn parse_f32(s: Option<&str>) -> Option<f32> {
+    let s = s?;
+    let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
+        (true, r)
+    } else {
+        (false, s.strip_prefix('+').unwrap_or(s))
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let mut it = rest.splitn(2, '.');
+    let ip = it.next()?;
+    let fp = it.next().unwrap_or("");
+    if ip.is_empty() && fp.is_empty() {
+        return None;
+    }
+    let mut v = if ip.is_empty() {
+        0.0
+    } else {
+        ip.parse::<u32>().ok()? as f32
+    };
+    if !fp.is_empty() {
+        let frac = fp.parse::<u32>().ok()? as f32;
+        let mut den = 1.0f32;
+        for _ in 0..fp.len() {
+            den *= 10.0;
+        }
+        v += frac / den;
+    }
+    Some(if neg { -v } else { v })
 }
 
 fn fmt_i32(v: i32, out: &mut [u8; 12]) -> usize {

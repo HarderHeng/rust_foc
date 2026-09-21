@@ -35,6 +35,7 @@ pub struct As5600 {
     last_raw: Option<u16>,
     unwrap: i32,
     last_theta: f32,
+    omega_f: f32,
 }
 
 impl As5600 {
@@ -44,6 +45,7 @@ impl As5600 {
             last_raw: None,
             unwrap: 0,
             last_theta: 0.0,
+            omega_f: 0.0,
         }
     }
 
@@ -57,10 +59,7 @@ impl As5600 {
             .await
             .is_err()
         {
-            return AngleSample {
-                valid: false,
-                ..Default::default()
-            };
+            return self.hold(As5600Status::default());
         }
         let st = status_buf[0];
         let status = As5600Status {
@@ -75,14 +74,13 @@ impl As5600 {
             .await
             .is_err()
         {
-            return AngleSample {
-                valid: false,
-                status,
-                ..Default::default()
-            };
+            return self.hold(status);
         }
 
         let raw = (((angle_buf[0] as u16) << 8) | angle_buf[1] as u16) & 0x0FFF;
+        if !status.magnet_ok || status.too_weak {
+            return self.hold(status);
+        }
         if let Some(prev) = self.last_raw {
             let mut d = raw as i32 - prev as i32;
             if d > 2048 {
@@ -97,18 +95,29 @@ impl As5600 {
         self.last_raw = Some(raw);
 
         let theta_m = (self.unwrap as f32) * (TWO_PI / 4096.0);
-        let omega_m = if dt > 0.0 {
+        let raw_w = if dt > 0.0 {
             (theta_m - self.last_theta) / dt
         } else {
             0.0
         };
         self.last_theta = theta_m;
+        self.omega_f = 0.2 * raw_w + 0.8 * self.omega_f;
 
         AngleSample {
             raw,
             theta_m,
-            omega_m,
-            valid: status.magnet_ok && !status.too_weak,
+            omega_m: self.omega_f,
+            valid: true,
+            status,
+        }
+    }
+
+    fn hold(&self, status: As5600Status) -> AngleSample {
+        AngleSample {
+            raw: self.last_raw.unwrap_or(0),
+            theta_m: self.last_theta,
+            omega_m: self.omega_f,
+            valid: false,
             status,
         }
     }

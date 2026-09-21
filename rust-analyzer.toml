@@ -1,7 +1,11 @@
-# Embedded default target has no libtest. Don't typecheck --tests/--benches.
+# Embedded default target has no libtest / std test harness.
 [cargo]
 target = "thumbv7em-none-eabihf"
 allTargets = false
 
+[cfg]
+setTest = false
+
 [check]
 allTargets = false
+extraArgs = ["--lib", "--bins"]

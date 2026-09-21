@@ -7,8 +7,10 @@ use embassy_stm32::gpio::OutputType;
 use embassy_stm32::peripherals::{PA8, PA9, PA10, PA12, PB15, PC13, TIM1};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::timer::Channel;
-use embassy_stm32::timer::complementary_pwm::{ComplementaryPwm, ComplementaryPwmPin, Mms2};
-use embassy_stm32::timer::low_level::CountingMode;
+use embassy_stm32::timer::complementary_pwm::{
+    BreakComparatorPolarity, BreakInputPolarity, ComplementaryPwm, ComplementaryPwmPin, FilterValue, Mms2,
+};
+use embassy_stm32::timer::low_level::{CountingMode, MasterMode};
 use embassy_stm32::timer::simple_pwm::PwmPin;
 use static_cell::StaticCell;
 
@@ -75,10 +77,11 @@ impl MotorPwm {
         inner.enable(Channel::Ch3);
 
         let max_duty = inner.get_max_duty();
-        // CH4 unused on pins: OC4REF at ARR → TRGO2 near PWM peak (low-side ON).
-        inner.enable(Channel::Ch4);
+        // CH4 unused on pins: CCR=ARR → OC4REF at counter peak (low-side ON).
+        // Cube 122: TRGO = OC4REF, TRGO2 = RESET; ADC injected uses TIM1_CH4.
         inner.set_duty(Channel::Ch4, max_duty);
-        inner.set_mms2(Mms2::COMPARE_OC4);
+        embassy_stm32::pac::TIM1.cr2().modify(|w| w.set_mms(MasterMode::COMPARE_OC4));
+        inner.set_mms2(Mms2::RESET);
 
         let mid = max_duty / 2;
         inner.set_duty(Channel::Ch1, mid);
@@ -87,6 +90,26 @@ impl MotorPwm {
         inner.set_master_output_enable(false);
 
         Self { inner, max_duty }
+    }
+
+    /// 122 `MX_TIM1`: BKCOMP1/2/4 → BRK, filter FDIV2_N6, AOE off.
+    /// Call after DAC/COMP are live so a floating comparator cannot trip first.
+    pub fn enable_comp_break(&mut self) {
+        self.inner.set_break_input_pin_enable(false);
+        self.inner
+            .set_break_comparator_polarity(0, BreakComparatorPolarity::NOT_INVERTED);
+        self.inner
+            .set_break_comparator_polarity(1, BreakComparatorPolarity::NOT_INVERTED);
+        self.inner
+            .set_break_comparator_polarity(3, BreakComparatorPolarity::NOT_INVERTED);
+        self.inner.set_break_comparator_enable(0, true);
+        self.inner.set_break_comparator_enable(1, true);
+        self.inner.set_break_comparator_enable(3, true);
+        self.inner.set_break_polarity(BreakInputPolarity::ACTIVE_HIGH);
+        self.inner.set_break_filter(FilterValue::FDTS_DIV2_N6);
+        self.inner.set_automatic_output_enable(false);
+        self.inner.set_break_enable(true);
+        embassy_stm32::pac::TIM1.dier().modify(|w| w.set_bie(true));
     }
 
     pub fn max_duty(&self) -> u32 {

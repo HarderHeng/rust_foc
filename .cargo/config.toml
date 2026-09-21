@@ -10,6 +10,10 @@ rustflags = [
 [build]
 target = "thumbv7em-none-eabihf"
 
+[alias]
+# Unit tests need a host target (thumb has no libtest).
+htest = "test --target x86_64-unknown-linux-gnu --lib"
+
 # Compile-time defmt filter. Unset means all `defmt::*` macros are stripped.
 [env]
 DEFMT_LOG = "info"

@@ -20,7 +20,18 @@ pub fn svpwm(ab: AlphaBeta, vbus: f32) -> Duties {
 
 /// SVPWM inscribed-circle voltage limit (volts).
 pub fn max_modulation(vbus: f32) -> f32 {
-    vbus * 0.57735026919
+    vbus * 0.577_350_26
+}
+
+/// Shift each duty by `±shift` according to phase-current sign (inverter convention).
+pub fn compensate_deadtime(d: Duties, ia: f32, ib: f32, ic: f32, shift: f32) -> Duties {
+    let s = |i: f32| if i >= 0.0 { shift } else { -shift };
+    Duties {
+        a: d.a + s(ia),
+        b: d.b + s(ib),
+        c: d.c + s(ic),
+    }
+    .clamp01()
 }
 
 #[cfg(test)]
@@ -42,5 +53,18 @@ mod tests {
         assert!((d.a - 0.5).abs() < 1e-5);
         assert!((d.b - 0.5).abs() < 1e-5);
         assert!((d.c - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn deadtime_follows_current_sign() {
+        let d = Duties {
+            a: 0.5,
+            b: 0.5,
+            c: 0.5,
+        };
+        let c = compensate_deadtime(d, 1.0, -1.0, 0.0, 0.02);
+        assert!((c.a - 0.52).abs() < 1e-5);
+        assert!((c.b - 0.48).abs() < 1e-5);
+        assert!((c.c - 0.52).abs() < 1e-5);
     }
 }

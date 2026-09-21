@@ -1,12 +1,11 @@
 //! Clarke / Park and inverses.
 
-#[cfg(not(test))]
 use micromath::F32Ext;
 
 use super::types::{AlphaBeta, Dq, PhaseAbc};
 
-const SQRT3_INV: f32 = 0.57735026919;
-const SQRT3_OVER_2: f32 = 0.86602540378;
+const SQRT3_INV: f32 = 0.577_350_26;
+const SQRT3_OVER_2: f32 = 0.866_025_4;
 
 pub fn wrap_2pi(theta: f32) -> f32 {
     const TWO_PI: f32 = core::f32::consts::TAU;

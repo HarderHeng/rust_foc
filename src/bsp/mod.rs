@@ -1,9 +1,5 @@
-//! Board Support Package (BSP) for STM32G431
-//!
-//! Provides clock and power configuration.
-
 pub mod board;
 pub mod config;
+pub mod pins;
 
-pub use board::*;
-pub use config::*;
+pub use board::init;
