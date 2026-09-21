@@ -37,7 +37,7 @@ pub fn compensate_deadtime(d: Duties, ia: f32, ib: f32, ic: f32, shift: f32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::foc::types::AlphaBeta;
+    use crate::types::AlphaBeta;
 
     #[test]
     fn duties_in_unit_interval() {

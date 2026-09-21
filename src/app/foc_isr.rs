@@ -39,7 +39,7 @@ pub fn on_injected(s: AnalogSample) {
     telemetry::publish_currents(s);
 
     if s.iu_a.abs() > SW_OCP_A || s.iv_a.abs() > SW_OCP_A || s.iw_a.abs() > SW_OCP_A {
-        control::fault();
+        control::fault(control::FaultKind::Overcurrent);
         return;
     }
 
@@ -88,7 +88,11 @@ fn step(s: AnalogSample) {
         control::capture_electrical_offset();
         0.0
     } else {
-        let (theta_m, _) = telemetry::theta_m_interp(CURRENT_LOOP_TS);
+        let (theta_m, valid) = telemetry::theta_m_interp(CURRENT_LOOP_TS);
+        if !valid {
+            // Hold last CCR. Encoder task trips after a grace window.
+            return;
+        }
         wrap_2pi(theta_m * f32::from(control::poles()) - control::theta_e_off())
     };
 

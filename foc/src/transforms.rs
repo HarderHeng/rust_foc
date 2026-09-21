@@ -1,5 +1,6 @@
 //! Clarke / Park and inverses.
 
+#[allow(unused_imports)]
 use micromath::F32Ext;
 
 use super::types::{AlphaBeta, Dq, PhaseAbc};
@@ -63,7 +64,7 @@ pub fn electrical_angle(theta_m: f32, offset_m: f32, pole_pairs: u8) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::foc::types::PhaseAbc;
+    use crate::types::PhaseAbc;
 
     fn close(a: f32, b: f32) {
         assert!((a - b).abs() < 1e-5, "{a} vs {b}");

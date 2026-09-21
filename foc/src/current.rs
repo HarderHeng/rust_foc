@@ -1,5 +1,6 @@
 //! One PWM-period current loop.
 
+#[allow(unused_imports)]
 use micromath::F32Ext;
 
 use super::pid::Pi;

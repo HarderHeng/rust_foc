@@ -12,10 +12,11 @@ const HIST_CAP: usize = 8;
 const PROMPT: &[u8] = b"G431> ";
 
 const ROOT_CMDS: &[&str] = &[
-    "help", "?", "hello", "clear", "version", "echo", "led", "system", "enc", "adc", "foc",
+    "help", "?", "hello", "clear", "version", "echo", "led", "system", "enc", "adc", "cal", "foc",
 ];
 const LED_SUB: &[&str] = &["on", "off", "toggle"];
 const SYSTEM_SUB: &[&str] = &["info"];
+const CAL_SUB: &[&str] = &["current"];
 const FOC_SUB: &[&str] = &[
     "status", "start", "stop", "align", "id", "iq", "poles", "pwm", "offset", "zero", "openloop", "rpm", "kp",
     "ki", "skp", "ski",
@@ -336,7 +337,7 @@ impl Shell {
             "help" | "?" => {
                 let _ = self.write_all(
                     b"help | hello [name] | clear | version | echo [text]\r\n\
-                      led on|off|toggle | system info | enc | adc\r\n\
+                      led on|off|toggle | system info | enc | adc | cal current\r\n\
                       foc status|start|stop|align|id <mA>|iq <mA>|poles <n>|pwm <%>\r\n\
                       foc kp|ki|skp|ski [x] | rpm <n> | openloop <vq_mV> <Hz>\r\n\
                       Tab: complete   Up/Down: history   Ctrl-C/U: abort/kill\r\n",
@@ -421,6 +422,18 @@ impl Shell {
                 let _ = self.write_i32(app::iw_raw() as i32).await;
                 let _ = self.write_all(b"\r\n").await;
             }
+            "cal" => match toks.next() {
+                Some("current") => {
+                    if control::calibrate_offsets() {
+                        let _ = self.write_all(b"current offset cal done\r\n").await;
+                    } else {
+                        let _ = self.write_all(b"cal blocked: foc stop first\r\n").await;
+                    }
+                }
+                _ => {
+                    let _ = self.write_all(b"usage: cal current\r\n").await;
+                }
+            },
             "foc" => self.cmd_foc(&mut toks).await,
             _ => {
                 let _ = self.write_all(b"unknown: ").await;
@@ -454,7 +467,11 @@ impl Shell {
                 let _ = self.write_i32(app::rpm_meas()).await;
                 let _ = self.write_all(b"/").await;
                 let _ = self.write_i32(control::rpm_ref()).await;
-                let _ = self.write_all(b"\r\n").await;
+                let _ = self.write_all(b" fault=").await;
+                let _ = self.write_all(control::last_fault().as_str().as_bytes()).await;
+                let _ = self.write_all(b" vbus=").await;
+                let _ = self.write_i32(app::vbus_mv() as i32).await;
+                let _ = self.write_all(b" mV\r\n").await;
             }
             Some("start") => {
                 if control::mode() == control::Mode::Fault {
@@ -674,6 +691,8 @@ fn completion_words(line: &str) -> Option<(&str, &'static [&'static str])> {
         (Some("led"), Some(b), false) => Some((b, LED_SUB)),
         (Some("system"), None, true) => Some(("", SYSTEM_SUB)),
         (Some("system"), Some(b), false) => Some((b, SYSTEM_SUB)),
+        (Some("cal"), None, true) => Some(("", CAL_SUB)),
+        (Some("cal"), Some(b), false) => Some((b, CAL_SUB)),
         _ => None,
     }
 }
@@ -707,7 +726,10 @@ fn apply_completion(line: &mut [u8; LINE_CAP], len: &mut usize, prefix: &str, fi
 }
 
 fn maybe_space_after(line: &mut [u8; LINE_CAP], len: &mut usize, word: &str) {
-    if matches!(word, "foc" | "led" | "system" | "hello" | "echo" | "id" | "iq" | "poles" | "pwm")
+    if matches!(
+        word,
+        "foc" | "led" | "system" | "cal" | "hello" | "echo" | "id" | "iq" | "poles" | "pwm"
+    )
         && *len < LINE_CAP
         && (*len == 0 || line[*len - 1] != b' ')
     {
@@ -835,6 +857,13 @@ mod tests {
         let (p, list) = completion_words("led ").unwrap();
         assert_eq!(p, "");
         assert_eq!(list, LED_SUB);
+    }
+
+    #[test]
+    fn complete_cal() {
+        let (p, list) = completion_words("cal ").unwrap();
+        assert_eq!(p, "");
+        assert_eq!(list, CAL_SUB);
     }
 
     #[test]

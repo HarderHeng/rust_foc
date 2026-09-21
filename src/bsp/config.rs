@@ -80,6 +80,9 @@ pub const SPEED_RPM_MAX: i32 = 8_000;
 
 pub const MAX_CURRENT_MA: i32 = 5_000;
 
+/// Run/Speed: trip if no `iq`/`rpm`/`start` command for this long.
+pub const CMD_TIMEOUT_MS: u32 = 2_000;
+
 /// 122 `DAC_OCP_Threshold` (12-bit DAC counts vs shunt/COMP).
 pub const OCP_DAC_COUNTS: u16 = 2893;
 

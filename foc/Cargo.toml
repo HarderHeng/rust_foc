@@ -1,0 +1,9 @@
+[package]
+edition = "2021"
+name = "foc"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+description = "Host-testable FOC math (Clarke/Park, PI, SVPWM)."
+
+[dependencies]
+micromath = "2.1.0"

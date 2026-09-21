@@ -39,7 +39,7 @@ pub fn tick(omega_m: f32, valid: bool, dt: f32) -> bool {
     }) else {
         return false;
     };
-    control::set_iq_ma((iq * 1000.0) as i32);
+    control::write_iq_ma((iq * 1000.0) as i32);
     true
 }
 

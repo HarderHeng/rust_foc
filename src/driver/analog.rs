@@ -133,6 +133,17 @@ pub fn read_bus() -> Option<AnalogSample> {
     analog_mut().map(|a| a.read_bus())
 }
 
+/// Re-run shunt offset (PWM off). Regular ADC, not the injected ISR path.
+pub fn recalibrate() -> bool {
+    match analog_mut() {
+        Some(a) => {
+            a.calibrate_offsets();
+            true
+        }
+        None => false,
+    }
+}
+
 fn analog_mut() -> Option<&'static mut Analog> {
     let p = ANALOG_PTR.load(Ordering::Acquire);
     if p.is_null() {
@@ -229,7 +240,8 @@ impl Analog {
         }
     }
 
-    /// After SVPWM: next CH4 edge uses the pair that still has low-side ON.
+    /// After SVPWM: program JSQR for the next CH4 edge.
+    /// `last_pair` is the pair the *next* JEOS must decode (conversion not yet taken).
     pub fn schedule_pair(&mut self, d: Duties) {
         self.next_pair = pair_from_duties(d);
         program_pair(self.next_pair);

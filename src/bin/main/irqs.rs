@@ -11,7 +11,7 @@ pub struct Tim1Brk;
 impl Handler<interrupt::typelevel::TIM1_BRK_TIM15> for Tim1Brk {
     unsafe fn on_interrupt() {
         TIM1.sr().modify(|w| w.set_bif(0, false));
-        control::fault();
+        control::fault(control::FaultKind::Brake);
     }
 }
 

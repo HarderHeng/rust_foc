@@ -24,7 +24,11 @@ pub async fn shell_task(
 pub async fn heartbeat_task(led: &'static LedHandle) {
     let mut count = 0u32;
     loop {
-        Timer::after_secs(1).await;
+        if control::mode() == control::Mode::Fault {
+            Timer::after_millis(100).await;
+        } else {
+            Timer::after_secs(1).await;
+        }
         count += 1;
         defmt::info!("heartbeat {}", count);
         led.lock().await.toggle();
@@ -46,7 +50,7 @@ pub async fn encoder_task(mut enc: As5600) {
         } else {
             miss = miss.saturating_add(1);
             if miss >= 20 && matches!(control::mode(), control::Mode::Run | control::Mode::Speed) {
-                control::fault();
+                control::fault(control::FaultKind::Encoder);
             }
         }
         let _ = speed::tick(s.omega_m, s.valid, dt.max(1e-4));
@@ -61,11 +65,12 @@ pub async fn analog_task() {
             telemetry::publish_bus(s);
             let mv = telemetry::vbus_mv();
             let t10 = telemetry::temp_c10();
-            if control::outputs_live()
-                && mv > 0
-                && (!(VBUS_UV_MV..=VBUS_OV_MV).contains(&mv) || t10 > (NTC_T_MAX_C * 10.0) as i16)
-            {
-                control::fault();
+            if control::outputs_live() && mv > 0 && !(VBUS_UV_MV..=VBUS_OV_MV).contains(&mv) {
+                control::fault(control::FaultKind::Vbus);
+            } else if control::outputs_live() && t10 > (NTC_T_MAX_C * 10.0) as i16 {
+                control::fault(control::FaultKind::Overtemp);
+            } else if control::cmd_timed_out() {
+                control::fault(control::FaultKind::CmdTimeout);
             }
         }
         Timer::after_millis(1).await;

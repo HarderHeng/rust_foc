@@ -3,11 +3,16 @@
 
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 
+use embassy_time::{Duration, Instant};
+
 use crate::app::{foc_isr, telemetry};
 use crate::app::speed as speed_loop;
-use crate::bsp::config::{CURRENT_KI, CURRENT_KP, MAX_CURRENT_MA, MOTOR_MAX_RPM, SPEED_KI, SPEED_KP, SPEED_RPM_MAX};
-use crate::foc::transforms::wrap_2pi;
+use crate::bsp::config::{
+    CMD_TIMEOUT_MS, CURRENT_KI, CURRENT_KP, MAX_CURRENT_MA, MOTOR_MAX_RPM, SPEED_KI, SPEED_KP, SPEED_RPM_MAX,
+};
+use crate::driver::analog;
 use crate::driver::pwm::with_pwm;
+use crate::foc::transforms::wrap_2pi;
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,6 +56,45 @@ impl Mode {
     }
 }
 
+/// Latched trip cause. Survives `foc stop` so the shell can still print it.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FaultKind {
+    None = 0,
+    Overcurrent = 1,
+    Vbus = 2,
+    Overtemp = 3,
+    Encoder = 4,
+    CmdTimeout = 5,
+    Brake = 6,
+}
+
+impl FaultKind {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Overcurrent,
+            2 => Self::Vbus,
+            3 => Self::Overtemp,
+            4 => Self::Encoder,
+            5 => Self::CmdTimeout,
+            6 => Self::Brake,
+            _ => Self::None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Overcurrent => "ocp",
+            Self::Vbus => "vbus",
+            Self::Overtemp => "ntc",
+            Self::Encoder => "enc",
+            Self::CmdTimeout => "timeout",
+            Self::Brake => "brk",
+        }
+    }
+}
+
 static MODE: AtomicU8 = AtomicU8::new(Mode::Idle as u8);
 static ALIGN_REQ: AtomicBool = AtomicBool::new(false);
 static ID_MA: AtomicI32 = AtomicI32::new(0);
@@ -66,6 +110,8 @@ static CUR_KP: AtomicU32 = AtomicU32::new(0);
 static CUR_KI: AtomicU32 = AtomicU32::new(0);
 static SPD_KP: AtomicU32 = AtomicU32::new(0);
 static SPD_KI: AtomicU32 = AtomicU32::new(0);
+static LAST_FAULT: AtomicU8 = AtomicU8::new(FaultKind::None as u8);
+static LAST_CMD_TICKS: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
 pub struct Snapshot {
@@ -101,6 +147,8 @@ pub fn start() {
     if mode() == Mode::Fault {
         return;
     }
+    LAST_FAULT.store(FaultKind::None as u8, Ordering::Relaxed);
+    touch_cmd();
     foc_isr::reset();
     let _ = with_pwm(|p| p.enable());
     MODE.store(Mode::Run as u8, Ordering::Relaxed);
@@ -113,6 +161,8 @@ pub fn start_openloop(vq_mv: i32, hz: u8) {
     use crate::bsp::config::{OPENLOOP_HZ_MAX, OPENLOOP_VQ_MAX_MV};
     OL_VQ_MV.store(vq_mv.clamp(0, OPENLOOP_VQ_MAX_MV), Ordering::Relaxed);
     OL_HZ.store(hz.min(OPENLOOP_HZ_MAX), Ordering::Relaxed);
+    LAST_FAULT.store(FaultKind::None as u8, Ordering::Relaxed);
+    touch_cmd();
     foc_isr::reset_openloop();
     let _ = with_pwm(|p| p.enable());
     MODE.store(Mode::Openloop as u8, Ordering::Relaxed);
@@ -136,6 +186,8 @@ pub fn start_speed(rpm: i32) {
     }
     let lim = i32::from(MOTOR_MAX_RPM).min(SPEED_RPM_MAX);
     RPM_REF.store(rpm.clamp(-lim, lim), Ordering::Relaxed);
+    LAST_FAULT.store(FaultKind::None as u8, Ordering::Relaxed);
+    touch_cmd();
     speed_loop::reset();
     foc_isr::reset();
     let _ = with_pwm(|p| p.enable());
@@ -145,6 +197,7 @@ pub fn start_speed(rpm: i32) {
 pub fn set_rpm_ref(rpm: i32) {
     let lim = i32::from(MOTOR_MAX_RPM).min(SPEED_RPM_MAX);
     RPM_REF.store(rpm.clamp(-lim, lim), Ordering::Relaxed);
+    touch_cmd();
 }
 
 pub fn rpm_ref() -> i32 {
@@ -156,6 +209,8 @@ pub fn start_bench() {
         return;
     }
     apply_bench_duty();
+    LAST_FAULT.store(FaultKind::None as u8, Ordering::Relaxed);
+    touch_cmd();
     let _ = with_pwm(|p| p.enable());
     MODE.store(Mode::Bench as u8, Ordering::Relaxed);
 }
@@ -167,11 +222,37 @@ pub fn stop() {
     MODE.store(Mode::Idle as u8, Ordering::Relaxed);
 }
 
-pub fn fault() {
+pub fn fault(kind: FaultKind) {
     let _ = with_pwm(|p| p.disable());
     ALIGN_REQ.store(false, Ordering::Relaxed);
     speed_loop::reset();
+    LAST_FAULT.store(kind as u8, Ordering::Relaxed);
     MODE.store(Mode::Fault as u8, Ordering::Relaxed);
+}
+
+pub fn last_fault() -> FaultKind {
+    FaultKind::from_u8(LAST_FAULT.load(Ordering::Relaxed))
+}
+
+pub fn touch_cmd() {
+    LAST_CMD_TICKS.store(Instant::now().as_ticks() as u32, Ordering::Relaxed);
+}
+
+/// Run / Speed only: no new command for [`CMD_TIMEOUT_MS`].
+pub fn cmd_timed_out() -> bool {
+    if !matches!(mode(), Mode::Run | Mode::Speed) {
+        return false;
+    }
+    let last = LAST_CMD_TICKS.load(Ordering::Relaxed);
+    Instant::from_ticks(u64::from(last)).elapsed() > Duration::from_millis(u64::from(CMD_TIMEOUT_MS))
+}
+
+/// Blocking regular-ADC offset. PWM must be off.
+pub fn calibrate_offsets() -> bool {
+    if outputs_live() || mode() == Mode::Fault {
+        return false;
+    }
+    analog::recalibrate()
 }
 
 pub fn request_align() {
@@ -179,6 +260,8 @@ pub fn request_align() {
         return;
     }
     ALIGN_REQ.store(true, Ordering::Relaxed);
+    LAST_FAULT.store(FaultKind::None as u8, Ordering::Relaxed);
+    touch_cmd();
     let _ = with_pwm(|p| p.enable());
     MODE.store(Mode::Align as u8, Ordering::Relaxed);
 }
@@ -189,9 +272,16 @@ pub fn take_align() -> bool {
 
 pub fn set_id_ma(ma: i32) {
     ID_MA.store(ma.clamp(-MAX_CURRENT_MA, MAX_CURRENT_MA), Ordering::Relaxed);
+    touch_cmd();
 }
 
 pub fn set_iq_ma(ma: i32) {
+    write_iq_ma(ma);
+    touch_cmd();
+}
+
+/// Speed PI writes Iq without refreshing the command watchdog.
+pub fn write_iq_ma(ma: i32) {
     IQ_MA.store(ma.clamp(-MAX_CURRENT_MA, MAX_CURRENT_MA), Ordering::Relaxed);
 }
 
@@ -251,6 +341,7 @@ pub fn theta_e_off_mrad() -> i32 {
 pub fn init_gains() {
     set_current_gains(CURRENT_KP, CURRENT_KI);
     set_speed_gains(SPEED_KP, SPEED_KI);
+    touch_cmd();
 }
 
 pub fn current_kp() -> f32 {

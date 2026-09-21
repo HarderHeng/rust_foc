@@ -3,4 +3,9 @@
 pub mod app;
 pub mod bsp;
 pub mod driver;
-pub mod foc;
+
+/// Facade over the `foc` crate so existing `crate::foc::…` paths stay valid.
+pub mod foc {
+    pub use ::foc::*;
+    pub use ::foc::{current, pid, speed, svm, transforms, types};
+}

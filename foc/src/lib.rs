@@ -1,5 +1,7 @@
 //! FOC math. Call from the PWM/ADC ISR, not from Embassy tasks.
 
+#![no_std]
+
 pub mod current;
 pub mod pid;
 pub mod speed;
