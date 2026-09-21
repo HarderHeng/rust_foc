@@ -5,14 +5,17 @@ use core::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 use static_cell::StaticCell;
 
 use crate::app::{control, telemetry};
-use crate::bsp::config::{CURRENT_KI, CURRENT_KP, CURRENT_LOOP_TS, DEADTIME_DUTY, NOMINAL_VBUS_V, SW_OCP_A};
+use crate::bsp::config::{
+    CURRENT_KI, CURRENT_KP, CURRENT_LOOP_TS, DEADTIME_DUTY, DEFAULT_POLE_PAIRS, MOTOR_KE_VRMS_PER_KRPM, MOTOR_LS_H,
+    NOMINAL_VBUS_V, SW_OCP_A,
+};
 use crate::foc::svm::compensate_deadtime;
 use crate::driver::analog::AnalogSample;
 use crate::driver::pwm::with_pwm;
 use crate::foc::transforms::wrap_2pi;
 use crate::foc::current::openloop_voltage;
 use crate::foc::transforms::park;
-use crate::foc::{CurrentLoop, Dq};
+use crate::foc::{CurrentLoop, Dq, DqFf, dq_voltage_ff, flux_from_ke_vrms_ll_krpm};
 
 static LOOP: StaticCell<CurrentLoop> = StaticCell::new();
 static LOOP_PTR: AtomicPtr<CurrentLoop> = AtomicPtr::new(core::ptr::null_mut());
@@ -105,8 +108,19 @@ fn step(s: AnalogSample) {
         },
     };
 
+    let omega_e = telemetry::enc_omega_mrad() as f32 / 1000.0 * f32::from(control::poles());
+    let ff = dq_voltage_ff(
+        refs,
+        omega_e,
+        DqFf {
+            ld: MOTOR_LS_H,
+            lq: MOTOR_LS_H,
+            flux: flux_from_ke_vrms_ll_krpm(MOTOR_KE_VRMS_PER_KRPM, f32::from(DEFAULT_POLE_PAIRS)),
+        },
+    );
+
     let Some(duties) = with_loop(|l| {
-        let (meas, duties) = l.step(s.iu_a, s.iv_a, refs, theta_e, vbus, CURRENT_LOOP_TS);
+        let (meas, duties) = l.step(s.iu_a, s.iv_a, refs, theta_e, vbus, CURRENT_LOOP_TS, ff);
         telemetry::publish_dq(meas);
         duties
     }) else {

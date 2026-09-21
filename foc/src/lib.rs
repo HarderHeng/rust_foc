@@ -9,6 +9,7 @@ pub mod svm;
 pub mod transforms;
 pub mod types;
 
-pub use current::{CurrentLoop, openloop_voltage};
+pub use current::{CurrentLoop, DqFf, dq_voltage_ff, flux_from_ke_vrms_ll_krpm, openloop_voltage};
+pub use pid::{AntiWindup, Pi, Pid, PidIn};
 pub use speed::SpeedLoop;
 pub use types::{Dq, Duties, PhaseAbc};
