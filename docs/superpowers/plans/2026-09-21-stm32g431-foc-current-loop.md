@@ -15,22 +15,10 @@
 ## File Structure (additions)
 
 ```
-src/
-├── bsp/config.rs              # extend: PWM pins, ADC/OPAMP, I2C, scales
-├── driver/
-│   ├── pwm.rs                 # TIM1 complementary PWM
-│   ├── analog.rs              # OPAMP + dual ADC + DMA
-│   └── as5600.rs              # I2C angle
-├── foc/
-│   ├── mod.rs
-│   ├── types.rs
-│   ├── transforms.rs
-│   ├── svm.rs
-│   ├── pid.rs
-│   └── current.rs
-└── app/
-    ├── mod.rs
-    └── foc_isr.rs
+foc/                           # host-testable math (`cargo htest`)
+src/app/{control,foc_isr,speed,shell,telemetry}.rs
+src/driver/{pwm,analog,as5600,ocp}.rs
+src/bin/main/{main,tasks,bringup,irqs}.rs
 ```
 
 Do not move the current-loop math into Embassy tasks.
@@ -80,15 +68,15 @@ pub const DEFAULT_POLE_PAIRS: u8 = 7; // change per motor
 
 **Files:** Create `src/driver/analog.rs`
 
-- [ ] **Step 1:** OPAMP1/2 PGA (or follower if the board already sets external gain) matching ESC-G431; OPAMP3 internal output.
+- [x] **Step 1:** OPAMP1/2/3 PGA ×16; OPAMP3 `OPAINTOEN` switched per UW vs UV/VW (122).
 
-- [ ] **Step 2:** ADC1+ADC2 simultaneous, TIM1 TRGO2 trigger, DMA into a double buffer.
+- [x] **Step 2:** ADC1+ADC2 injected, TIM1 CH4 / OC4REF (PWM2), JEOS ISR (no DMA double-buffer).
 
-- [ ] **Step 3:** Convert counts → amps / volts using `config.rs`. Sign must match the inverting network.
+- [x] **Step 3:** Convert counts → amps / volts using `config.rs`. Sign matches the inverting network.
 
-- [ ] **Step 4:** `calibrate_offsets()` with PWM safe (MOE off or 50% and motor disconnected). Store Ia/Ib/(Ic) offsets.
+- [x] **Step 4:** `calibrate_offsets()` / `cal current` with PWM off.
 
-- [ ] **Step 5:** Optional: reconstruct `ic = -ia-ib`; log `ia+ib+ic` residual.
+- [x] **Step 5:** Reconstruct missing phase (`ic = -ia-ib`).
 
 **Stop if:** samples are not synchronized to PWM mid, or offset jumps more than a few tens of counts between cals.
 
@@ -98,13 +86,13 @@ pub const DEFAULT_POLE_PAIRS: u8 = 7; // change per motor
 
 **Files:** `src/foc/svm.rs`, `src/foc/transforms.rs`, `src/app/foc_isr.rs`
 
-- [ ] **Step 1:** Implement inverse Clarke + SVPWM (`Vα,Vβ,Vbus` → three duties).
+- [x] **Step 1:** Inverse Clarke + midpoint SVPWM (`Vα,Vβ,Vbus` → three duties).
 
-- [ ] **Step 2:** ISR or a test mode: ramp `θe`, fixed `Vd=0`, small `Vq`, write TIM1.
+- [x] **Step 2:** `foc openloop <vq_mV> <Hz>`: ramp `θe`, fixed Vq.
 
 - [ ] **Step 3:** Motor on a stand: rotor turns smoothly; current traces look like phase-shifted sinusoids.
 
-- [ ] **Step 4:** Shell: `foc openloop <vq> <hz>` / `foc stop`.
+- [x] **Step 4:** Shell: `foc openloop <vq_mV> <Hz>` / `foc stop`.
 
 **Stop if:** cogging/jumps, or one phase current is dead (PWM or OPAMP pin wrong).
 
@@ -120,9 +108,9 @@ pub const DEFAULT_POLE_PAIRS: u8 = 7; // change per motor
 
 - [x] **Step 3:** 1 kHz Embassy task publishes `{theta_m, omega_m, valid}` to a lock-free slot.
 
-- [ ] **Step 4:** ISR interpolates `theta_m + omega_m * dt`, then `theta_e = wrap(pole_pairs * (theta_m - offset))`.
+- [x] **Step 4:** ISR interpolates `theta_m + omega_m * dt`, then `theta_e = wrap(pole_pairs * theta_m - offset)`.
 
-- [ ] **Step 5:** Shell: `enc` prints deg, status, MAG.
+- [x] **Step 5:** Shell: `enc` prints deg / status.
 
 **Stop if:** MAG not OK, or angle does not increase monotonically when turning the rotor by hand.
 
@@ -140,7 +128,7 @@ pub const DEFAULT_POLE_PAIRS: u8 = 7; // change per motor
 
 - [x] **Step 4:** Voltage circle limit using VBUS.
 
-- [ ] **Step 5:** Host-side unit tests are optional (std test crate later); at minimum, check Clarke/Park invertibility with a few vectors in comments or a small `#[cfg(test)]` if you add a lib test feature.
+- [x] **Step 5:** `cargo htest` (`foc` crate): Clarke/Park, SVPWM, Pid, slew.
 
 ---
 
@@ -148,15 +136,15 @@ pub const DEFAULT_POLE_PAIRS: u8 = 7; // change per motor
 
 **Files:** `src/app/foc_isr.rs`, `src/bin/main.rs`, `src/driver/shell.rs`
 
-- [ ] **Step 1:** State machine: `Idle → Cal → Align → Run → Fault`.
+- [x] **Step 1:** Modes: Idle, Bench, Align, Run, Openloop, Speed, Fault.
 
-- [ ] **Step 2:** Align: `id_ref` small, `iq_ref=0`, 0.5–1 s, capture AS5600 as `theta_offset`.
+- [x] **Step 2:** Align: 500 ms, default `id=500 mA`, `iq=0`, `θe=0`, then latch offset (or `fault=enc`).
 
-- [ ] **Step 3:** Run: `id_ref=0`, operator sets `iq_ref`. ISR uses interpolated `θe`.
+- [x] **Step 3:** Run: slewed `id`/`iq`; ISR uses interpolated `θe`. Speed mode: 1 kHz PI → Iq.
 
-- [ ] **Step 4:** Shell: `foc start|stop|align|id|iq|poles|status`.
+- [x] **Step 4:** Shell: `foc start|stop|align|id|iq|poles|status|rpm|openloop|…`.
 
-- [ ] **Step 5:** Tune Kp/Ki on a stand (start conservative). Id should stay near 0; Iq should step-track.
+- [ ] **Step 5:** Tune Kp/Ki on a stand. Id near 0; Iq tracks the 10 A/s ramp.
 
 **Stop if:** Park frame is wrong (Iq/Id swap or sign) — flip current sign or `θ_offset` by π, do not “tune around” a 180° error.
 
@@ -166,11 +154,11 @@ pub const DEFAULT_POLE_PAIRS: u8 = 7; // change per motor
 
 **Files:** `src/app/foc_isr.rs`, `src/driver/led.rs`, shell
 
-- [ ] **Step 1:** Latch: overcurrent, VBUS UV/OV, AS5600 invalid/timeout, command timeout.
+- [x] **Step 1:** Latch: OCP, BRK, VBUS, NTC, encoder, command timeout.
 
-- [ ] **Step 2:** On fault: TIM1 outputs off, LED distinct from heartbeat, `foc status` shows latch + `foc stop` to clear.
+- [x] **Step 2:** Fault: MOE off, ~5 Hz LED, `foc status` keeps `fault=` after `foc stop`.
 
-- [ ] **Step 3:** Confirm USART2 shell and PC6 heartbeat still run while FOC is idle.
+- [x] **Step 3:** USART2 shell and PC6 heartbeat run while FOC is idle.
 
 ---
 

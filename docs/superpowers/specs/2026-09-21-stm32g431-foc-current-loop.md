@@ -1,17 +1,17 @@
 # STM32G431 FOC Current-Loop Design
 
-**Date**: 2026-09-21  
+**Date**: 2026-09-21 (updated 2026-09-22)  
 **Target**: STM32G431CB, board electrically compatible with ST B-G431B-ESC1  
 **Position**: AS5600 (I2C)  
-**First closed loop**: Id / Iq current loop
+**Closed loops**: Id / Iq current (20 kHz ISR); optional speed PI (~1 kHz)
 
-This document is the FOC design after the existing infrastructure (clock, PC6 LED, USART2 shell). It does not replace `2026-04-03-stm32g431-foc-design.md`.
+This document is the FOC design after the existing infrastructure (clock, PC6 LED, USART2 shell). It does not replace `2026-04-03-stm32g431-foc-design.md`. Hardware constants and R3_2 sampling follow Cube project `122`.
 
 ## Overview
 
-Implement Field-Oriented Control on the existing Embassy Rust crate. PWM, current sampling, and the Id/Iq PI run in a **hard real-time interrupt path**. Embassy stays for shell, telemetry, and AS5600 I2C.
+Field-Oriented Control on the Embassy firmware crate `stm32g431-foc`. PWM, current sampling, and the Id/Iq PI run in the **ADC JEOS ISR**. Embassy stays for shell, telemetry, AS5600 I2C, align timing, and reference ramps.
 
-First milestone is a stable current loop: given `id_ref` / `iq_ref` and electrical angle from AS5600, regulate measured Id/Iq and drive TIM1 SVPWM.
+Clarke / Park / PI / SVPWM / slew live in the host-testable `foc/` crate (`cargo htest`). The firmware re-exports it as `crate::foc`.
 
 ## Hardware Baseline (B-G431B-ESC1)
 
@@ -51,19 +51,24 @@ Official analog constants (verify on the clone if shunts differ):
 ## Control Architecture
 
 ```
+                    1 kHz: slew id*/iq*/rpm*     (foc::slew, not inside Pid)
 AS5600 (I2C, ~1 kHz) ──interp θe──┐
                                   │
 Ia,Ib (,Ic) ─Clarke─Park(θe)─► Id,Iq
                                   │
-id_ref, iq_ref ── PI ── Vd,Vq ─invPark─ SVPWM ─ TIM1
+              id, iq ── PI ── Vπ ─ + Vff ─ circle ─ invPark ─ SVPWM ─ TIM1
                                   ▲
-                     VBUS for modulation limit
+                     VBUS; PI.track(V − Vff) after circle
 ```
 
-- **PWM**: TIM1 center-aligned, 20 kHz, complementary, dead-time ~800 ns (tune to FET/driver).
-- **Current loop**: 20 kHz, same as PWM period, **ADC EOC / DMA TC ISR** (not an Embassy task).
-- **Angle**: I2C cannot run at 20 kHz. Read AS5600 in a 1 kHz task; unwrap 12-bit angle; interpolate `θe` in the ISR with last electrical speed.
-- **Optional later**: AS5600 analog OUT onto an ADC channel for per-PWM angle (PB12 pot pin is the natural spare).
+- **PWM**: TIM1 center-aligned, 20 kHz, complementary, firmware dead-time 750 ns (`SW_DEADTIME_NS`). Pins idle-low, OSSI/OSSR on. CH4 is PWM2; `CCR4` follows 122 `Tafter` / `Tbefore`.
+- **Current sense**: R3_2 two-phase pair each PWM. OPAMP3 `OPAINTOEN` on for UW (ADC2 CH18), off for UV/VW (PB1 / ADC1 IN12).
+- **Current loop**: 20 kHz, ADC1 JEOS (not an Embassy task).
+- **Pid**: portable parallel PI/PID; clamps its own output; `track(applied)` for outer limits. No motor model, no voltage circle inside Pid.
+- **Vqd feed-forward** (122 `FF_VqdffComputation`, after PI): `vd_ff = −ωe·Lq·iq*`, `vq_ff = ωe·Ld·id* + ωe·ψf` (`Ld=Lq=LS`, `ψf` from `Ke`).
+- **Angle**: AS5600 at ~1 kHz; ISR interpolates `θm + ωm·dt`. Invalid encoder: hold last CCR; trip after grace in Run/Speed.
+- **Align**: `foc align [mA]` — hold `id` (default 500 mA), `iq=0`, `θe=0` for 500 ms, latch `θ_offset`, coast to Idle. Encoder invalid → `fault=enc`.
+- **Ramps** (~1 kHz): Id/Iq 10 A/s in Align/Run; rpm 6420 rpm/s in Speed, starting from measured rpm.
 
 ## Timing
 
@@ -72,33 +77,29 @@ TIM1 (center-aligned)
         ┌──── period 50 µs ────┐
 cnt  __/‾‾‾‾‾‾‾\______/‾‾‾‾
            ▲
-           └── TRGO2 at peak: low-side FETs ON → 3-shunt valid
-               ADC1+ADC2 simultaneous sample
-               DMA complete → current-loop ISR
+           └── TIM1 CH4 / OC4REF (PWM2): low-side ON window
+               ADC1+ADC2 injected; JEOS → current-loop ISR
 ```
 
-- Dual ADC: U on ADC1, V on ADC2 in one trigger; W on the next slot or same sequence via OPAMP3 internal.
-- First implementation: sample **two phases** every PWM, reconstruct the third (`ia+ib+ic=0`), keep the third OPAMP for `ia+ib+ic` residual check.
-- Offset calibration: PWM 50% / outputs disabled or zero voltage, average N samples at startup.
+- Dual ADC: pair UV / UW / VW per 122 sector rule; reconstruct the third (`ia+ib+ic=0`).
+- Offset calibration: PWM off, regular ADC (`cal current`).
 
 ## Software Layers
 
 ```
+foc/                         # no_std math; `cargo htest`
+├── pid.rs                   # Pid + track; Pi alias
+├── slew.rs                  # reference rate limit
+├── current.rs               # PI → Vff → circle → SVPWM
+├── speed.rs / svm / transforms / types
 src/
-├── bin/main.rs          # Embassy: shell, I2C poll, telemetry
-├── bsp/                 # clocks, pin/scale constants
-├── driver/
-│   ├── pwm.rs           # TIM1 complementary + brake
-│   ├── analog.rs        # OPAMP + dual ADC + DMA
-│   └── as5600.rs        # I2C angle, status, unwrap
-├── foc/
-│   ├── types.rs         # SI-ish f32 state
-│   ├── transforms.rs    # Clarke / Park / inv Park
-│   ├── svm.rs           # inverse Clarke + SVPWM
-│   ├── pid.rs           # PI + anti-windup
-│   └── current.rs       # one-step current loop
+├── bin/main/                # Embassy: shell, encoder, analog, button
+├── bsp/                     # clocks, 122 electrical constants
+├── driver/                  # pwm, analog (R3_2), as5600, ocp, led
 └── app/
-    └── foc_isr.rs       # ISR glue, fault flags
+    ├── control.rs           # mode, refs, align, ramps, faults
+    ├── foc_isr.rs           # JEOS current step
+    └── speed.rs / shell / telemetry
 ```
 
 **ISR budget (170 MHz, ~50 µs period):** keep the current step under ~15 µs. Use `f32`; G431 has FPU. Use CORDIC for `sin/cos` if the ISR is tight; otherwise `libm`/`micromath` is acceptable for the first bring-up.
@@ -111,41 +112,44 @@ Embassy tasks must not take TIM1, ADC1/2, OPAMP1/2/3, or the ADC DMA channels us
 2. Reconstruct missing phase if needed.
 3. Clarke → `Iα, Iβ`.
 4. `θe = pole_pairs * θm_interp` (wrap 0..2π).
-5. Park → `Id, Iq`.
-6. PI: `Vd, Vq` with anti-windup; circle-limit `√(Vd²+Vq²) ≤ Vbus/√3` (SVPWM).
-7. inv Park → `Vα, Vβ` → SVM → three compare values.
-8. Write TIM1 CCR1/2/3. Update debug snapshot (atomics / lock-free slot).
+5. Park → `Id, Iq` (`θe = 0` in Align).
+6. `Vπ = PI(e)` (Pid clamp + back-calc). `V* = Vπ + Vff`. Circle-limit `√(Vd²+Vq²) ≤ Vbus/√3`. `PI.track(V − Vff)` if scaled.
+7. inv Park → `Vα, Vβ` → SVM → CCR1/2/3 and next-pair JSQR / OPAMP3 route.
+8. Telemetry atomics for shell (`foc status`).
 
 **Align / boot:**
 
-1. Brake / PWM off, ADC offset cal.
-2. Optional forced align: `id_ref > 0`, `iq_ref = 0` for N ms, store AS5600 as `θ_offset` (or use mechanical zero).
-3. Enable current loop with `id_ref = 0`, small `iq_ref`.
+1. `foc stop`, `cal current` (PWM off).
+2. `foc align` [optional mA]: ramp `id`, `iq=0`, `θe=0` for 500 ms; latch encoder as `θ_offset`; Idle.
+3. `foc start`, then `foc iq <mA>` (10 A/s slew).
 
 ## Shell (extend existing CLI)
 
 | Command | Action |
 |---------|--------|
-| `foc status` | state, Id/Iq meas/ref, θe, Vbus, faults |
-| `foc start` / `foc stop` | enable / coast or brake |
-| `foc iq <A>` / `foc id <A>` | set references (clamped) |
-| `foc align` | forced-d align, save offset |
-| `foc poles <n>` | pole pairs |
-| `cal current` | re-run shunt offset |
+| `foc status` | mode, slewed refs, meas Id/Iq, offset, rpm, `fault=`, Vbus; `align_left` while aligning |
+| `foc start` / `foc stop` | current loop / coast (MOE off) |
+| `foc id <mA>` / `foc iq <mA>` | targets; slewed at 10 A/s in Run |
+| `foc align [mA]` | forced-D hold then latch offset (default 500 mA / 500 ms) |
+| `foc rpm <n>` | speed mode; rpm slewed from measured speed |
+| `foc openloop <vq_mV> <Hz>` | fixed Vq, ramped θe |
+| `foc poles <n>` / `foc offset` / `foc zero` | pole pairs / electrical offset |
+| `foc kp\|ki\|skp\|ski` | current / speed gains |
+| `cal current` | shunt offset (PWM must be off) |
 
 ## Safety (minimum for first spin)
 
-- Phase overcurrent (raw ADC or amps)
-- VBUS undervoltage / overvoltage
-- AS5600 MAG invalid / I2C timeout → trip after grace, do not free-run Park
-- Command timeout (no new `iq` / heartbeat)
-- Fault → TIM1 MOE off (outputs inactive), LED pattern, shell reports latch
+- Phase overcurrent (amps vs `SW_OCP_A`); COMP1/2/4 + DAC3 → TIM1 BRK (`fault=brk`)
+- VBUS undervoltage / overvoltage; NTC overtemp
+- AS5600 invalid → hold Park; trip after grace in Run/Speed (`fault=enc`)
+- Command timeout 2 s on Run/Speed (`fault=timeout`); speed-loop Iq does not pet the watchdog
+- Fault → TIM1 MOE off (idle-low), ~5 Hz LED, `foc status` keeps `fault=` after `foc stop`
 
 ## Out of Scope (later)
 
-- Speed / position outer loops
-- Sensorless observer
-- Field weakening
+- Position loop
+- Sensorless observer (122 STO)
+- Field weakening / 122 Vd-priority circle
 - CAN / ST MCSDK interoperability
 - High-rate analog angle path
 
@@ -154,7 +158,7 @@ Embassy tasks must not take TIM1, ADC1/2, OPAMP1/2/3, or the ADC DMA channels us
 1. 20 kHz center-aligned complementary PWM visible on UH/VH/WH with dead-time.
 2. With motor disconnected, offset cal is stable; reconstructed `ia+ib+ic` residual is small at 50% duty.
 3. Open-loop voltage (fixed `Vq`, `θe` ramp) turns the rotor; current waveform is sinusoidal-ish.
-4. After align, step `iq_ref` and Id/Iq track without trip; `id` stays near 0.
+4. After align, ramp `iq_ref` and Id/Iq track without trip; `id` stays near 0.
 5. Fault injection (overcurrent clamp / unplug AS5600) disables PWM.
 6. Existing LED / UART shell still work.
 
