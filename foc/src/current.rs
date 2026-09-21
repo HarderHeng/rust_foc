@@ -53,6 +53,16 @@ impl VoltageFeedforward for DqFf {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct CurrentStep {
+    pub meas: Dq,
+    /// PI + feed-forward before final voltage limiting.
+    pub voltage_ref: Dq,
+    /// Final limited D/Q voltage applied to the modulator.
+    pub voltage: Dq,
+    pub duties: Duties,
+}
+
 /// Defaults: PI + SVPWM + Vd-priority (ST MCWB-style).
 pub struct CurrentLoop<R = Pi, M = Svpwm, L = VdPriority> {
     pub id: R,
@@ -107,6 +117,19 @@ impl<R: Regulator, M: Modulator, L: VoltageLimiter> CurrentLoop<R, M, L> {
         dt: f32,
         ff: Dq,
     ) -> (Dq, Duties) {
+        let out = self.step_debug(i, refs, theta_e, vbus, dt, ff);
+        (out.meas, out.duties)
+    }
+
+    pub fn step_debug(
+        &mut self,
+        i: impl PhaseCurrents,
+        refs: Dq,
+        theta_e: f32,
+        vbus: f32,
+        dt: f32,
+        ff: Dq,
+    ) -> CurrentStep {
         let lim = self.modulator.voltage_limit(vbus);
         Regulator::set_limits(&mut self.id, -lim, lim);
         Regulator::set_limits(&mut self.iq, -lim, lim);
@@ -115,17 +138,25 @@ impl<R: Regulator, M: Modulator, L: VoltageLimiter> CurrentLoop<R, M, L> {
         let vd_pi = Regulator::step(&mut self.id, refs.d - meas.d, dt);
         let vq_pi = Regulator::step(&mut self.iq, refs.q - meas.q, dt);
 
-        let vd = vd_pi + ff.d;
-        let vq = vq_pi + ff.q;
-        let (vd, vq) = self.limiter.limit(vd, vq, lim);
+        let voltage_ref = Dq {
+            d: vd_pi + ff.d,
+            q: vq_pi + ff.q,
+        };
+        let (vd, vq) = self.limiter.limit(voltage_ref.d, voltage_ref.q, lim);
+        let voltage = Dq { d: vd, q: vq };
 
-        if (vd - (vd_pi + ff.d)).abs() > 1e-9 || (vq - (vq_pi + ff.q)).abs() > 1e-9 {
-            Regulator::track(&mut self.id, vd - ff.d);
-            Regulator::track(&mut self.iq, vq - ff.q);
+        if (voltage.d - voltage_ref.d).abs() > 1e-9 || (voltage.q - voltage_ref.q).abs() > 1e-9 {
+            Regulator::track(&mut self.id, voltage.d - ff.d);
+            Regulator::track(&mut self.iq, voltage.q - ff.q);
         }
 
-        let duties = self.modulator.modulate(inv_park(Dq { d: vd, q: vq }, theta_e), vbus);
-        (meas, duties)
+        let duties = self.modulator.modulate(inv_park(voltage, theta_e), vbus);
+        CurrentStep {
+            meas,
+            voltage_ref,
+            voltage,
+            duties,
+        }
     }
 }
 

@@ -72,6 +72,10 @@ static IV_RAW: AtomicU16 = AtomicU16::new(0);
 static IW_RAW: AtomicU16 = AtomicU16::new(0);
 static ID_MEAS_MA: AtomicI16 = AtomicI16::new(0);
 static IQ_MEAS_MA: AtomicI16 = AtomicI16::new(0);
+static UD_MV: AtomicI16 = AtomicI16::new(0);
+static UQ_MV: AtomicI16 = AtomicI16::new(0);
+static UD_REF_MV: AtomicI16 = AtomicI16::new(0);
+static UQ_REF_MV: AtomicI16 = AtomicI16::new(0);
 static ISR_CYCLES: AtomicU32 = AtomicU32::new(0);
 static ISR_CYCLES_MAX: AtomicU32 = AtomicU32::new(0);
 
@@ -97,6 +101,18 @@ pub fn publish_bus(s: AnalogSample) {
 pub fn publish_dq(dq: crate::foc::Dq) {
     ID_MEAS_MA.store((dq.d * 1000.0) as i16, Ordering::Relaxed);
     IQ_MEAS_MA.store((dq.q * 1000.0) as i16, Ordering::Relaxed);
+}
+
+pub fn publish_vdq(applied: crate::foc::Dq, reference: crate::foc::Dq) {
+    UD_MV.store(volts_to_mv_i16(applied.d), Ordering::Relaxed);
+    UQ_MV.store(volts_to_mv_i16(applied.q), Ordering::Relaxed);
+    UD_REF_MV.store(volts_to_mv_i16(reference.d), Ordering::Relaxed);
+    UQ_REF_MV.store(volts_to_mv_i16(reference.q), Ordering::Relaxed);
+}
+
+fn volts_to_mv_i16(v: f32) -> i16 {
+    let mv = (v * 1000.0) as i32;
+    mv.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
 /// Last JEOS ISR duration in CPU cycles (no defmt / no RTT in that path).
@@ -136,6 +152,22 @@ pub fn id_meas_ma() -> i16 {
 
 pub fn iq_meas_ma() -> i16 {
     IQ_MEAS_MA.load(Ordering::Relaxed)
+}
+
+pub fn ud_mv() -> i16 {
+    UD_MV.load(Ordering::Relaxed)
+}
+
+pub fn uq_mv() -> i16 {
+    UQ_MV.load(Ordering::Relaxed)
+}
+
+pub fn ud_ref_mv() -> i16 {
+    UD_REF_MV.load(Ordering::Relaxed)
+}
+
+pub fn uq_ref_mv() -> i16 {
+    UQ_REF_MV.load(Ordering::Relaxed)
 }
 
 pub fn iu_ma() -> i16 {

@@ -19,7 +19,7 @@ probe-rs run --chip STM32G431CB   # default cargo runner
 
 USART2 is **921600** 8N1 (PB3 TX / PB4 RX). Tune and watch the loop on this UART (`foc status`, `foc isr`). Do not halt the core with a probe-rs/SWD breakpoint while PWM is live.
 
-`DEFMT_LOG=info` is in `.cargo/config.toml` for boot/NVM/UART errors. The 20 kHz ISR does not call `defmt`. Unset `DEFMT_LOG` later if you want those macros compiled out.
+`DEFMT_LOG=info` is in `.cargo/config.toml` for boot/NVM/UART errors and the 100 ms RTT FOC debug line. RTT is best-effort (`drop-on-contention` + non-blocking): lines may be dropped rather than stalling control. The 20 kHz ISR does not call `defmt`. Unset `DEFMT_LOG` later if you want those macros compiled out.
 
 ## First spin (shell)
 

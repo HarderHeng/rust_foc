@@ -4,9 +4,11 @@ use embassy_stm32::usart::{RingBufferedUartRx, UartTx};
 use embassy_time::{Duration, Instant, Timer};
 use stm32g431_foc::app::control;
 use stm32g431_foc::app::shell::Shell;
-use stm32g431_foc::app::telemetry;
 use stm32g431_foc::app::speed;
-use stm32g431_foc::bsp::config::{AS5600_PERIOD_US, ENC_FAULT_MS, NTC_T_MAX_C, VBUS_OV_MV, VBUS_UV_MV};
+use stm32g431_foc::app::telemetry;
+use stm32g431_foc::bsp::config::{
+    AS5600_PERIOD_US, ENC_FAULT_MS, NTC_T_MAX_C, VBUS_OV_MV, VBUS_UV_MV,
+};
 use stm32g431_foc::driver::analog;
 use stm32g431_foc::driver::as5600::As5600;
 use stm32g431_foc::driver::led::LedHandle;
@@ -22,15 +24,12 @@ pub async fn shell_task(
 
 #[embassy_executor::task]
 pub async fn heartbeat_task(led: &'static LedHandle) {
-    let mut count = 0u32;
     loop {
         if control::mode() == control::Mode::Fault {
             Timer::after_millis(100).await;
         } else {
             Timer::after_secs(1).await;
         }
-        count += 1;
-        defmt::info!("heartbeat {}", count);
         led.lock().await.toggle();
     }
 }
@@ -85,6 +84,34 @@ pub async fn analog_task() {
             control::fault(control::FaultKind::CmdTimeout);
         }
         Timer::after_millis(1).await;
+    }
+}
+
+#[embassy_executor::task]
+pub async fn foc_debug_task() {
+    loop {
+        Timer::after_millis(100).await;
+        defmt::info!(
+            "foc mode={} ia={} ib={} ic={} id={} iq={} id_ref={} iq_ref={} ud={} uq={} ud_ref={} uq_ref={} pos={} rpm={} vbus={} isr={}/{} fault={}",
+            control::mode().as_str(),
+            telemetry::iu_ma(),
+            telemetry::iv_ma(),
+            telemetry::iw_ma(),
+            telemetry::id_meas_ma(),
+            telemetry::iq_meas_ma(),
+            control::id_target_ma(),
+            control::iq_target_ma(),
+            telemetry::ud_mv(),
+            telemetry::uq_mv(),
+            telemetry::ud_ref_mv(),
+            telemetry::uq_ref_mv(),
+            telemetry::enc_mdeg(),
+            telemetry::rpm_meas(),
+            telemetry::vbus_mv(),
+            telemetry::isr_us(),
+            telemetry::isr_us_max(),
+            control::last_fault().as_str(),
+        );
     }
 }
 

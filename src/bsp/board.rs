@@ -24,6 +24,7 @@ pub fn init() -> embassy_stm32::Peripherals {
     config.rcc.sys = Sysclk::PLL1_R;
     config.rcc.apb1_pre = APBPrescaler::DIV1;
     config.rcc.apb2_pre = APBPrescaler::DIV1;
+    config.rcc.mux.adc12sel = mux::Adcsel::SYS;
     config.rcc.boost = true;
 
     embassy_stm32::init(config)

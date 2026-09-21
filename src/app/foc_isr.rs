@@ -83,10 +83,16 @@ fn openloop_step(s: AnalogSample) {
     let meas = park(clarke(s.abc()), th);
     telemetry::publish_dq(meas);
 
+    let voltage = Dq {
+        d: 0.0,
+        q: control::ol_vq_v(),
+    };
+    telemetry::publish_vdq(voltage, voltage);
+
     let duties = DeadTime {
         shift: DEADTIME_DUTY,
     }
-    .map(openloop_voltage(0.0, control::ol_vq_v(), th, vbus), s.abc());
+    .map(openloop_voltage(voltage.d, voltage.q, th, vbus), s.abc());
     apply_duties(duties);
 }
 
@@ -130,9 +136,10 @@ fn step(s: AnalogSample) {
     };
 
     let Some(duties) = with_loop(|l| {
-        let (meas, duties) = l.step(s, refs, theta_e, vbus, CURRENT_LOOP_TS, ff);
-        telemetry::publish_dq(meas);
-        duties
+        let out = l.step_debug(s, refs, theta_e, vbus, CURRENT_LOOP_TS, ff);
+        telemetry::publish_dq(out.meas);
+        telemetry::publish_vdq(out.voltage, out.voltage_ref);
+        out.duties
     }) else {
         return;
     };
