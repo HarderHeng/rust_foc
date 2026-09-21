@@ -108,7 +108,7 @@ Embassy tasks must not take TIM1, ADC1/2, OPAMP1/2/3, or the ADC DMA channels us
 
 ## Algorithm (one PWM period)
 
-1. Read DMA current counts → volts → amps (apply invert + offset).
+1. Read injected JDR counts → amps (invert + shunt offset).
 2. Reconstruct missing phase if needed.
 3. Clarke → `Iα, Iβ`.
 4. `θe = pole_pairs * θm_interp` (wrap 0..2π).
@@ -123,7 +123,26 @@ Embassy tasks must not take TIM1, ADC1/2, OPAMP1/2/3, or the ADC DMA channels us
 2. `foc align` [optional mA]: ramp `id`, `iq=0`, `θe=0` for 500 ms; latch encoder as `θ_offset`; Idle.
 3. `foc start`, then `foc iq <mA>` (10 A/s slew).
 
-## Shell (extend existing CLI)
+## Modes
+
+| Mode | Who writes TIM1 | Notes |
+|------|-----------------|-------|
+| Idle / Fault | none (MOE off) | Fault latches `FaultKind` |
+| Bench | equal duty (`foc pwm`) | Current loop does not write CCR |
+| Align | current ISR, `θe=0` | Then latch offset, return Idle |
+| Run | current ISR | Slewed `id`/`iq` |
+| Speed | current ISR | 1 kHz speed PI writes Iq (no Iq slew) |
+| Openloop | ISR, fixed Vq | Ramped electrical angle |
+
+## Bring-up (lab)
+
+1. PWM / `cal current`, motor disconnected.
+2. `foc openloop <vq_mV> <Hz>`, unloaded.
+3. `foc align` → check `off=` in `foc status`.
+4. `foc start` → small `foc iq`, Id ≈ 0.
+5. Optional `foc rpm <n>`.
+
+## Shell (USART2, 921600)
 
 | Command | Action |
 |---------|--------|
@@ -162,8 +181,10 @@ Embassy tasks must not take TIM1, ADC1/2, OPAMP1/2/3, or the ADC DMA channels us
 5. Fault injection (overcurrent clamp / unplug AS5600) disables PWM.
 6. Existing LED / UART shell still work.
 
-## Dependencies (add as needed)
+## Build
 
-- `micromath` or `libm` for `sin/cos/sqrt` if CORDIC HAL is not used yet
-- Embassy I2C (`embassy-stm32` I2C) for AS5600
-- No extra RTOS; ISR + Embassy only
+- Firmware: `cargo check --lib --bins` (default `thumbv7em-none-eabihf`); flash via `probe-rs` (`STM32G431CB`).
+- Host math tests: `cargo htest` (`foc` crate only; thumb has no libtest).
+- `DEFMT_LOG=info` in `.cargo/config.toml`.
+
+`micromath` is used inside `foc/`. Embassy I2C for AS5600. Custom line editor on USART2 (not `embedded-cli`). No extra RTOS.
