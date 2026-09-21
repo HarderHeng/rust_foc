@@ -14,6 +14,7 @@ pub use control::{
 };
 pub use telemetry::{
     enc_mdeg, enc_omega_mrad, enc_raw, enc_valid, id_meas_ma, iq_meas_ma, iu_ma, iu_raw, iv_ma, iv_raw, iw_ma, iw_raw,
-    publish_analog, publish_angle, publish_bus, publish_currents, publish_dq, rpm_meas, temp_c10, theta_m_interp,
+    publish_analog, publish_angle, publish_bus, publish_currents, publish_dq, rpm_meas, temp_c10, theta_m_predict,
+    theta_m_sample,
     vbus_mv,
 };

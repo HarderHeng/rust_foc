@@ -32,11 +32,11 @@ Pin map follows ST UM2516 Table 4. Existing BSP already matches LED and UART.
 | NTC | PB14 | ADC |
 | Status LED | PC6 | GPIO (existing) |
 | USART2 TX/RX | PB3 / PB4 | 921600 (existing) |
-| AS5600 SCL/SDA | PB8 / PB7 | I2C1 (official Z+/B+; PB6 is not I2C1) |
+| AS5600 SCL/SDA | PB8 / PB7 | I2C1 on J8 Z+/B+ (G431CB: I2C1_SCL is PB8, not A+/PB6) |
 | AS5600 DIR | tie GND or 3V3 | direction |
 | User button | PC10 | optional enable |
 
-**Assumption:** AS5600 uses I2C1 on the hall/encoder header: `PB8=SCL`, `PB7=SDA`, 3V3, GND. G431 does not map I2C1 onto PB6. If you wired SCL to PB6, either move the wire to PB8 or say so and we add a bit-bang bus.
+**Assumption:** AS5600 on J8: `PB8=SCL` (Z+/H3), `PB7=SDA` (B+/H2). UM2516 gives J8 **5 V** and GND (not 3V3). STM32G431CB I2C1_SCL is PB8/PA15 — **A+/PB6 is not I2C1** on this chip; if SCL is on PB6, move it to PB8 or bit-bang. I2C pins are 5 V-tolerant; add 2.2–4.7 kΩ pull-ups if the 10 kΩ hall resistors are too weak.
 
 Official analog constants (verify on the clone if shunts differ):
 
@@ -52,7 +52,7 @@ Official analog constants (verify on the clone if shunts differ):
 
 ```
                     1 kHz: slew id*/iq*/rpm*     (foc::slew, not inside Pid)
-AS5600 (I2C, ~1 kHz) ──interp θe──┐
+AS5600 (I2C1 PB8/PB7, ~2 kHz) ──θ+ω·age──┐
                                   │
 Ia,Ib (,Ic) ─Clarke─Park(θe)─► Id,Iq
                                   │
@@ -66,7 +66,7 @@ Ia,Ib (,Ic) ─Clarke─Park(θe)─► Id,Iq
 - **Current loop**: 20 kHz, ADC1 JEOS (not an Embassy task).
 - **Pid**: portable parallel PI/PID; clamps its own output; `track(applied)` for outer limits. No motor model, no voltage circle inside Pid.
 - **Vqd feed-forward** (`VoltageFeedforward`: `FfOff` / `DqFf`, after PI): `vd_ff = −ωe·Lq·iq*`, `vq_ff = ωe·Ld·id* + ωe·ψf` (`Ld=Lq=LS`, `ψf` from `Ke`). Align uses `FfOff`.
-- **Angle**: AS5600 at ~1 kHz; ISR interpolates `θm + ωm·dt`. Invalid encoder: hold last CCR; trip after grace in Run/Speed.
+- **Angle**: I2C1 `PB8=SCL` / `PB7=SDA` (J8 Z+/B+), 400 kHz, addr `0x36`. STATUS then ANGLE (not a STATUS burst). ~2 kHz poll. `foc::AngleTrack` unwraps/filters ω; ISR `θ + ω · age`. Invalid: hold CCR; trip after 20 ms in Run/Speed.
 - **Align**: `foc align [mA]` — hold `id` (default 500 mA), `iq=0`, `θe=0` for 500 ms, latch `θ_offset`, coast to Idle. Encoder invalid → `fault=enc`.
 - **Ramps** (~1 kHz): Id/Iq 10 A/s in Align/Run; rpm 6420 rpm/s in Speed, starting from measured rpm.
 
@@ -89,6 +89,7 @@ cnt  __/‾‾‾‾‾‾‾\______/‾‾‾‾
 ```
 foc/                         # no_std math; `cargo htest`
 ├── pid.rs                   # Pid + track; Pi alias
+├── angle.rs                 # unwrap, ω IIR, predict(θ,ω,age), park_theta
 ├── traits.rs                # Regulator, Modulator, VoltageLimiter, VoltageFeedforward, DutySink
 ├── slew.rs                  # reference rate limit
 ├── current.rs               # CurrentLoop<R,M,L>: PI → Vff → Vd-priority → SVPWM

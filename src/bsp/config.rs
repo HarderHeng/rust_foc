@@ -114,7 +114,12 @@ pub const CMD_TIMEOUT_MS: u32 = 2_000;
 pub const OCP_DAC_COUNTS: u16 = 2893;
 
 pub const AS5600_I2C_ADDR: u8 = 0x36;
+/// Fast-mode (AS5600 also allows Fast-mode Plus 1 MHz; J8 10 kΩ hall pull-ups usually cannot).
 pub const AS5600_I2C_HZ: u32 = 400_000;
+/// Target poll period after STATUS+ANGLE (two I2C cycles). ~1.5–2.5 kHz at 400 kHz.
+pub const AS5600_PERIOD_US: u32 = 400;
+/// Run/Speed: trip if no valid magnet/I2C for this long.
+pub const ENC_FAULT_MS: u32 = 20;
 
 pub fn adc_to_amps(counts: u16, offset: u16) -> f32 {
     let volts = (counts as f32 - offset as f32) * (ADC_VREF / ADC_FULL_SCALE);

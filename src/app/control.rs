@@ -429,7 +429,7 @@ pub fn pwm_pct() -> u8 {
 }
 
 pub fn capture_electrical_offset() {
-    let (theta_m, _) = telemetry::theta_m_interp(0.0);
+    let (theta_m, _) = telemetry::theta_m_sample();
     let te = wrap_2pi(theta_m * f32::from(poles()));
     THETA_E_OFF_MRAD.store((te * 1000.0) as i32, Ordering::Relaxed);
 }

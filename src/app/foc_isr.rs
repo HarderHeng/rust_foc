@@ -14,7 +14,7 @@ use crate::driver::pwm::with_pwm;
 use crate::foc::current::openloop_voltage;
 use crate::foc::transforms::{clarke, park, wrap_2pi};
 use crate::foc::{
-    CurrentLoop, DeadTime, Dq, DqFf, DutyMap, DutySink, FfOff, PhaseCurrents, VoltageFeedforward,
+    park_theta, CurrentLoop, DeadTime, Dq, DqFf, DutyMap, DutySink, FfOff, PhaseCurrents, VoltageFeedforward,
     flux_from_ke_vrms_ll_krpm,
 };
 
@@ -86,12 +86,12 @@ fn step(s: AnalogSample) {
         // Forced D-axis: Park at 0 until `poll_align` latches the encoder offset.
         0.0
     } else {
-        let (theta_m, valid) = telemetry::theta_m_interp(CURRENT_LOOP_TS);
+        let (theta_m, valid) = telemetry::theta_m_predict(CURRENT_LOOP_TS);
         if !valid {
             // Hold last CCR. Encoder task trips after a grace window.
             return;
         }
-        wrap_2pi(theta_m * f32::from(control::poles()) - control::theta_e_off())
+        park_theta(theta_m, control::theta_e_off(), control::poles())
     };
 
     let refs = Dq {

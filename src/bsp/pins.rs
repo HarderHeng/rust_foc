@@ -47,7 +47,7 @@ pub mod io {
     pub const BUTTON: &str = "PC10";
     pub const UART_TX: &str = "PB3";
     pub const UART_RX: &str = "PB4";
-    /// I2C1 SCL (Z+). Not PB6 — G431 I2C1 has no PB6.
+    /// I2C1 SCL = J8 Z+/H3. G431CB: I2C1_SCL is PB8 (and PA15), not A+/PB6.
     pub const ENC_SCL: &str = "PB8";
     pub const ENC_SDA: &str = "PB7";
 }

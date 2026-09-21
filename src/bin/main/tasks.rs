@@ -1,12 +1,12 @@
 use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::mode::Async;
 use embassy_stm32::usart::{RingBufferedUartRx, UartTx};
-use embassy_time::{Instant, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use stm32g431_foc::app::control;
 use stm32g431_foc::app::shell::Shell;
 use stm32g431_foc::app::telemetry;
 use stm32g431_foc::app::speed;
-use stm32g431_foc::bsp::config::{NTC_T_MAX_C, VBUS_OV_MV, VBUS_UV_MV};
+use stm32g431_foc::bsp::config::{AS5600_PERIOD_US, ENC_FAULT_MS, NTC_T_MAX_C, VBUS_OV_MV, VBUS_UV_MV};
 use stm32g431_foc::driver::analog;
 use stm32g431_foc::driver::as5600::As5600;
 use stm32g431_foc::driver::led::LedHandle;
@@ -38,23 +38,26 @@ pub async fn heartbeat_task(led: &'static LedHandle) {
 #[embassy_executor::task]
 pub async fn encoder_task(mut enc: As5600) {
     let mut last = Instant::now();
-    let mut miss = 0u8;
+    let mut last_ok = Instant::now();
+    let period = Duration::from_micros(AS5600_PERIOD_US as u64);
     loop {
-        let now = Instant::now();
-        let dt = now.duration_since(last).as_micros() as f32 / 1_000_000.0;
-        last = now;
-        let s = enc.read(dt.max(1e-4)).await;
+        let start = Instant::now();
+        let dt = start.duration_since(last).as_micros() as f32 / 1_000_000.0;
+        last = start;
+        let s = enc.read(dt.max(1e-5)).await;
         telemetry::publish_angle(s.raw, s.theta_m, s.omega_m, s.valid);
         if s.valid {
-            miss = 0;
-        } else {
-            miss = miss.saturating_add(1);
-            if miss >= 20 && matches!(control::mode(), control::Mode::Run | control::Mode::Speed) {
-                control::fault(control::FaultKind::Encoder);
-            }
+            last_ok = start;
+        } else if start.duration_since(last_ok) >= Duration::from_millis(ENC_FAULT_MS as u64)
+            && matches!(control::mode(), control::Mode::Run | control::Mode::Speed)
+        {
+            control::fault(control::FaultKind::Encoder);
         }
-        let _ = speed::tick(s.omega_m, s.valid, dt.max(1e-4));
-        Timer::after_millis(1).await;
+        let _ = speed::tick(s.omega_m, s.valid, dt.max(1e-5));
+        let used = Instant::now().duration_since(start);
+        if used < period {
+            Timer::after(period - used).await;
+        }
     }
 }
 
