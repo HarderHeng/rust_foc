@@ -1,17 +1,19 @@
 //! Runtime mode and references. Embassy and the current ISR share this.
 //! Hardware enable/duty go through here only — not through the shell.
 
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 
 use embassy_time::{Duration, Instant};
 
 use crate::app::{foc_isr, telemetry};
 use crate::app::speed as speed_loop;
 use crate::bsp::config::{
-    CMD_TIMEOUT_MS, CURRENT_KI, CURRENT_KP, MAX_CURRENT_MA, MOTOR_MAX_RPM, SPEED_KI, SPEED_KP, SPEED_RPM_MAX,
+    ALIGN_ID_MA, ALIGN_MS, CMD_TIMEOUT_MS, CURRENT_KI, CURRENT_KP, IDQ_RAMP_A_S, MAX_CURRENT_MA, MOTOR_MAX_RPM,
+    RPM_RAMP_RPM_S, SPEED_KI, SPEED_KP, SPEED_RPM_MAX,
 };
 use crate::driver::analog;
 use crate::driver::pwm::with_pwm;
+use crate::foc::slew::approach_i32;
 use crate::foc::transforms::wrap_2pi;
 
 #[repr(u8)]
@@ -96,9 +98,11 @@ impl FaultKind {
 }
 
 static MODE: AtomicU8 = AtomicU8::new(Mode::Idle as u8);
-static ALIGN_REQ: AtomicBool = AtomicBool::new(false);
 static ID_MA: AtomicI32 = AtomicI32::new(0);
 static IQ_MA: AtomicI32 = AtomicI32::new(0);
+static ID_TGT_MA: AtomicI32 = AtomicI32::new(0);
+static IQ_TGT_MA: AtomicI32 = AtomicI32::new(0);
+static RPM_TGT: AtomicI32 = AtomicI32::new(0);
 static POLES: AtomicU8 = AtomicU8::new(crate::bsp::config::DEFAULT_POLE_PAIRS);
 static PWM_DUTY_PCT: AtomicU8 = AtomicU8::new(50);
 /// Electrical angle at D-axis lock (`poles * θm` when `θe = 0`).
@@ -112,6 +116,7 @@ static SPD_KP: AtomicU32 = AtomicU32::new(0);
 static SPD_KI: AtomicU32 = AtomicU32::new(0);
 static LAST_FAULT: AtomicU8 = AtomicU8::new(FaultKind::None as u8);
 static LAST_CMD_TICKS: AtomicU32 = AtomicU32::new(0);
+static ALIGN_START_TICKS: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
 pub struct Snapshot {
@@ -185,7 +190,9 @@ pub fn start_speed(rpm: i32) {
         return;
     }
     let lim = i32::from(MOTOR_MAX_RPM).min(SPEED_RPM_MAX);
-    RPM_REF.store(rpm.clamp(-lim, lim), Ordering::Relaxed);
+    let tgt = rpm.clamp(-lim, lim);
+    RPM_TGT.store(tgt, Ordering::Relaxed);
+    RPM_REF.store(telemetry::rpm_meas().clamp(-lim, lim), Ordering::Relaxed);
     LAST_FAULT.store(FaultKind::None as u8, Ordering::Relaxed);
     touch_cmd();
     speed_loop::reset();
@@ -196,12 +203,16 @@ pub fn start_speed(rpm: i32) {
 
 pub fn set_rpm_ref(rpm: i32) {
     let lim = i32::from(MOTOR_MAX_RPM).min(SPEED_RPM_MAX);
-    RPM_REF.store(rpm.clamp(-lim, lim), Ordering::Relaxed);
+    RPM_TGT.store(rpm.clamp(-lim, lim), Ordering::Relaxed);
     touch_cmd();
 }
 
 pub fn rpm_ref() -> i32 {
     RPM_REF.load(Ordering::Relaxed)
+}
+
+pub fn rpm_target() -> i32 {
+    RPM_TGT.load(Ordering::Relaxed)
 }
 
 pub fn start_bench() {
@@ -217,14 +228,14 @@ pub fn start_bench() {
 
 pub fn stop() {
     let _ = with_pwm(|p| p.disable());
-    ALIGN_REQ.store(false, Ordering::Relaxed);
     speed_loop::reset();
+    ID_MA.store(0, Ordering::Relaxed);
+    IQ_MA.store(0, Ordering::Relaxed);
     MODE.store(Mode::Idle as u8, Ordering::Relaxed);
 }
 
 pub fn fault(kind: FaultKind) {
     let _ = with_pwm(|p| p.disable());
-    ALIGN_REQ.store(false, Ordering::Relaxed);
     speed_loop::reset();
     LAST_FAULT.store(kind as u8, Ordering::Relaxed);
     MODE.store(Mode::Fault as u8, Ordering::Relaxed);
@@ -255,34 +266,104 @@ pub fn calibrate_offsets() -> bool {
     analog::recalibrate()
 }
 
-pub fn request_align() {
+/// Hold D-axis current with θe=0 for [`ALIGN_MS`], then latch encoder as offset and coast.
+pub fn request_align(id_ma: Option<i32>) {
     if mode() == Mode::Fault {
         return;
     }
-    ALIGN_REQ.store(true, Ordering::Relaxed);
+    let id = id_ma.unwrap_or(ALIGN_ID_MA).clamp(1, MAX_CURRENT_MA);
+    ID_TGT_MA.store(id, Ordering::Relaxed);
+    IQ_TGT_MA.store(0, Ordering::Relaxed);
+    IQ_MA.store(0, Ordering::Relaxed);
+    ALIGN_START_TICKS.store(Instant::now().as_ticks() as u32, Ordering::Relaxed);
     LAST_FAULT.store(FaultKind::None as u8, Ordering::Relaxed);
     touch_cmd();
+    foc_isr::reset();
     let _ = with_pwm(|p| p.enable());
     MODE.store(Mode::Align as u8, Ordering::Relaxed);
 }
 
-pub fn take_align() -> bool {
-    ALIGN_REQ.swap(false, Ordering::Relaxed)
+/// Call from a 1 ms task. Completes align after the hold window.
+pub fn poll_align() {
+    if mode() != Mode::Align {
+        return;
+    }
+    if align_left_ms() > 0 {
+        return;
+    }
+    finish_align();
+}
+
+pub fn align_left_ms() -> u32 {
+    if mode() != Mode::Align {
+        return 0;
+    }
+    let start = Instant::from_ticks(u64::from(ALIGN_START_TICKS.load(Ordering::Relaxed)));
+    let gone = start.elapsed().as_millis() as u32;
+    ALIGN_MS.saturating_sub(gone)
+}
+
+fn finish_align() {
+    if !telemetry::enc_valid() {
+        ID_TGT_MA.store(0, Ordering::Relaxed);
+        ID_MA.store(0, Ordering::Relaxed);
+        fault(FaultKind::Encoder);
+        return;
+    }
+    capture_electrical_offset();
+    ID_TGT_MA.store(0, Ordering::Relaxed);
+    IQ_TGT_MA.store(0, Ordering::Relaxed);
+    ID_MA.store(0, Ordering::Relaxed);
+    IQ_MA.store(0, Ordering::Relaxed);
+    foc_isr::reset();
+    let _ = with_pwm(|p| p.disable());
+    MODE.store(Mode::Idle as u8, Ordering::Relaxed);
 }
 
 pub fn set_id_ma(ma: i32) {
-    ID_MA.store(ma.clamp(-MAX_CURRENT_MA, MAX_CURRENT_MA), Ordering::Relaxed);
+    ID_TGT_MA.store(ma.clamp(-MAX_CURRENT_MA, MAX_CURRENT_MA), Ordering::Relaxed);
     touch_cmd();
 }
 
 pub fn set_iq_ma(ma: i32) {
-    write_iq_ma(ma);
+    IQ_TGT_MA.store(ma.clamp(-MAX_CURRENT_MA, MAX_CURRENT_MA), Ordering::Relaxed);
     touch_cmd();
 }
 
-/// Speed PI writes Iq without refreshing the command watchdog.
+/// Speed PI writes Iq without refreshing the command watchdog or the Iq slew.
 pub fn write_iq_ma(ma: i32) {
-    IQ_MA.store(ma.clamp(-MAX_CURRENT_MA, MAX_CURRENT_MA), Ordering::Relaxed);
+    let v = ma.clamp(-MAX_CURRENT_MA, MAX_CURRENT_MA);
+    IQ_MA.store(v, Ordering::Relaxed);
+    IQ_TGT_MA.store(v, Ordering::Relaxed);
+}
+
+/// 1 ms: slew Id/Iq (Run/Align) and rpm (Speed). ISR reads the slewed values.
+pub fn poll_refs() {
+    const DT: f32 = 0.001;
+    let ma_s = IDQ_RAMP_A_S * 1000.0;
+    match mode() {
+        Mode::Align | Mode::Run => {
+            let id = approach_i32(id_ma(), ID_TGT_MA.load(Ordering::Relaxed), ma_s, DT);
+            ID_MA.store(id, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    if mode() == Mode::Run {
+        let iq = approach_i32(iq_ma(), IQ_TGT_MA.load(Ordering::Relaxed), ma_s, DT);
+        IQ_MA.store(iq, Ordering::Relaxed);
+    }
+    if mode() == Mode::Speed {
+        let rpm = approach_i32(rpm_ref(), RPM_TGT.load(Ordering::Relaxed), RPM_RAMP_RPM_S, DT);
+        RPM_REF.store(rpm, Ordering::Relaxed);
+    }
+}
+
+pub fn id_target_ma() -> i32 {
+    ID_TGT_MA.load(Ordering::Relaxed)
+}
+
+pub fn iq_target_ma() -> i32 {
+    IQ_TGT_MA.load(Ordering::Relaxed)
 }
 
 pub fn id_ma() -> i32 {

@@ -338,7 +338,7 @@ impl Shell {
                 let _ = self.write_all(
                     b"help | hello [name] | clear | version | echo [text]\r\n\
                       led on|off|toggle | system info | enc | adc | cal current\r\n\
-                      foc status|start|stop|align|id <mA>|iq <mA>|poles <n>|pwm <%>\r\n\
+                      foc status|start|stop|align [mA]|id <mA>|iq <mA>|poles <n>|pwm <%>\r\n\
                       foc kp|ki|skp|ski [x] | rpm <n> | openloop <vq_mV> <Hz>\r\n\
                       Tab: complete   Up/Down: history   Ctrl-C/U: abort/kill\r\n",
                 )
@@ -471,7 +471,13 @@ impl Shell {
                 let _ = self.write_all(control::last_fault().as_str().as_bytes()).await;
                 let _ = self.write_all(b" vbus=").await;
                 let _ = self.write_i32(app::vbus_mv() as i32).await;
-                let _ = self.write_all(b" mV\r\n").await;
+                let _ = self.write_all(b" mV").await;
+                if s.mode == control::Mode::Align {
+                    let _ = self.write_all(b" align_left=").await;
+                    let _ = self.write_i32(control::align_left_ms() as i32).await;
+                    let _ = self.write_all(b" ms").await;
+                }
+                let _ = self.write_all(b"\r\n").await;
             }
             Some("start") => {
                 if control::mode() == control::Mode::Fault {
@@ -489,15 +495,20 @@ impl Shell {
                 if control::mode() == control::Mode::Fault {
                     let _ = self.write_all(b"blocked: fault (foc stop)\r\n").await;
                 } else {
-                    control::request_align();
-                    let _ = self.write_all(b"align requested\r\n").await;
+                    let id = parse_i32(toks.next());
+                    control::request_align(id);
+                    let _ = self.write_all(b"align id=").await;
+                    let _ = self.write_i32(control::id_target_ma()).await;
+                    let _ = self.write_all(b" mA hold=").await;
+                    let _ = self.write_i32(control::align_left_ms() as i32).await;
+                    let _ = self.write_all(b" ms\r\n").await;
                 }
             }
             Some("id") => match parse_i32(toks.next()) {
                 Some(ma) => {
                     control::set_id_ma(ma);
                     let _ = self.write_all(b"id_ref=").await;
-                    let _ = self.write_i32(control::id_ma()).await;
+                    let _ = self.write_i32(control::id_target_ma()).await;
                     let _ = self.write_all(b" mA\r\n").await;
                 }
                 None => {
@@ -508,7 +519,7 @@ impl Shell {
                 Some(ma) => {
                     control::set_iq_ma(ma);
                     let _ = self.write_all(b"iq_ref=").await;
-                    let _ = self.write_i32(control::iq_ma()).await;
+                    let _ = self.write_i32(control::iq_target_ma()).await;
                     let _ = self.write_all(b" mA\r\n").await;
                 }
                 None => {
@@ -550,8 +561,8 @@ impl Shell {
                         let _ = self.write_all(b"blocked: fault (foc stop)\r\n").await;
                     } else {
                         control::start_speed(rpm);
-                        let _ = self.write_all(b"speed rpm_ref=").await;
-                        let _ = self.write_i32(control::rpm_ref()).await;
+                        let _ = self.write_all(b"speed rpm_tgt=").await;
+                        let _ = self.write_i32(control::rpm_target()).await;
                         let _ = self.write_all(b"\r\n").await;
                     }
                 }
@@ -602,7 +613,7 @@ impl Shell {
                 }
             },
             _ => {
-                let _ = self.write_all(b"usage: foc status|start|stop|align|id|iq|poles|pwm|offset|zero|openloop|rpm|kp|ki|skp|ski\r\n").await;
+                let _ = self.write_all(b"usage: foc status|start|stop|align [mA]|id|iq|poles|pwm|offset|zero|openloop|rpm|kp|ki|skp|ski\r\n").await;
             }
         }
     }

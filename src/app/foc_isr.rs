@@ -85,10 +85,7 @@ fn step(s: AnalogSample) {
     let vbus = vbus_v();
 
     let theta_e = if control::mode() == control::Mode::Align {
-        if control::take_align() {
-            reset();
-        }
-        control::capture_electrical_offset();
+        // Forced D-axis: Park at 0 until `poll_align` latches the encoder offset.
         0.0
     } else {
         let (theta_m, valid) = telemetry::theta_m_interp(CURRENT_LOOP_TS);

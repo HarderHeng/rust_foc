@@ -83,6 +83,10 @@ pub const CURRENT_KI: f32 = MOTOR_RS_OHM * CURRENT_BW_RAD;
 
 pub const SW_OCP_A: f32 = NOMINAL_CURRENT_A * 1.5;
 
+/// Forced-D align (`foc align`): hold `id`, `iq=0`, θe=0, then latch encoder as offset.
+pub const ALIGN_MS: u32 = 500;
+pub const ALIGN_ID_MA: i32 = 500;
+
 /// 122 `OV_VOLTAGE_THRESHOLD_V` / `UD_VOLTAGE_THRESHOLD_V`
 pub const VBUS_OV_MV: u16 = 28_000;
 pub const VBUS_UV_MV: u16 = 8_000;
@@ -97,6 +101,11 @@ pub const SPEED_KI: f32 = 0.01;
 pub const SPEED_RPM_MAX: i32 = 8_000;
 
 pub const MAX_CURRENT_MA: i32 = 5_000;
+
+/// Medium-frequency reference ramps (122 STC-style, ~1 kHz).
+pub const IDQ_RAMP_A_S: f32 = 10.0;
+/// 0 → `MOTOR_MAX_RPM` in 1 s (`OPEN_LOOP_SPEED_RAMP_DURATION_MS`).
+pub const RPM_RAMP_RPM_S: f32 = MOTOR_MAX_RPM as f32;
 
 /// Run/Speed: trip if no `iq`/`rpm`/`start` command for this long.
 pub const CMD_TIMEOUT_MS: u32 = 2_000;

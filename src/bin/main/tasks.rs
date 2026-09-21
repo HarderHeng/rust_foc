@@ -73,6 +73,8 @@ pub async fn analog_task() {
                 control::fault(control::FaultKind::CmdTimeout);
             }
         }
+        control::poll_align();
+        control::poll_refs();
         Timer::after_millis(1).await;
     }
 }
