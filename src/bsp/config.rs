@@ -19,6 +19,24 @@ pub const fn pwm_deadtime_ticks() -> u16 {
 /// Dead-time as PWM duty (750 ns × 20 kHz ≈ 0.015).
 pub const DEADTIME_DUTY: f32 = (PWM_DEADTIME_NS as f32 * PWM_FREQ_HZ as f32) / 1_000_000_000.0;
 
+/// 122 `TNOISE_NS` — used with dead-time for the mid-PWM sample window.
+pub const TNOISE_NS: u32 = 1_000;
+
+pub const fn tw_after_ticks() -> u32 {
+    ((SYSCLK_FREQ_HZ as u64) * (PWM_DEADTIME_NS + TNOISE_NS) as u64 / 1_000_000_000) as u32
+}
+
+/// 122 `TW_BEFORE`: a few ADC sample + trigger ticks.
+pub const fn tw_before_ticks() -> u32 {
+    16
+}
+
+/// Stay on UV / CCR4≈ARR while `(1 − max_duty) > this` (122 `ARR − maxCCR > Tafter`).
+pub const SAMPLE_CENTER_MARGIN: f32 = {
+    let arr = SYSCLK_FREQ_HZ / (2 * PWM_FREQ_HZ);
+    tw_after_ticks() as f32 / arr as f32
+};
+
 /// `RSHUNT`
 pub const SHUNT_OHM: f32 = 0.003;
 

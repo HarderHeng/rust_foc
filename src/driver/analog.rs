@@ -15,7 +15,7 @@ use embassy_stm32::peripherals::{
 use embassy_stm32::Peri;
 use static_cell::StaticCell;
 
-use crate::bsp::config::{adc_to_amps, adc_to_temp_c, adc_to_vbus};
+use crate::bsp::config::{adc_to_amps, adc_to_temp_c, adc_to_vbus, SAMPLE_CENTER_MARGIN};
 use crate::foc::Duties;
 
 const VBUS_SAMPLE: SampleTime = SampleTime::CYCLES247_5;
@@ -196,7 +196,14 @@ fn write_jsqr(adc: embassy_stm32::pac::adc::Adc, ch: u8) {
     });
 }
 
+/// G4: `OPAINTOEN=1` routes OPAMP3 to ADC2 CH18 and disconnects PB1 (ADC1 IN12).
+fn route_opamp3(pair: ShuntPair) {
+    let internal = matches!(pair, ShuntPair::Uw);
+    embassy_stm32::pac::OPAMP3.csr().modify(|w| w.set_opaintoen(internal));
+}
+
 fn program_pair(pair: ShuntPair) {
+    route_opamp3(pair);
     match pair {
         ShuntPair::Uv => {
             write_jsqr(ADC1, ADC1_CH_U);
@@ -214,10 +221,8 @@ fn program_pair(pair: ShuntPair) {
 }
 
 fn pair_from_duties(d: Duties) -> ShuntPair {
-    let max = d.a.max(d.b).max(d.c);
-    let min = d.a.min(d.b).min(d.c);
-    // ST: stay on AB (UV) while the mid-PWM window is wide enough.
-    if max - min < 0.25 {
+    // 122: keep sector 5 (UV) while ARR − maxCCR > Tafter.
+    if 1.0 - d.a.max(d.b).max(d.c) > SAMPLE_CENTER_MARGIN {
         return ShuntPair::Uv;
     }
     if d.a >= d.b && d.a >= d.c {
@@ -248,6 +253,7 @@ impl Analog {
         self.last_pair = self.next_pair;
     }
     pub fn calibrate_offsets(&mut self) {
+        route_opamp3(ShuntPair::Uv);
         let mut su = 0u32;
         let mut sv = 0u32;
         let mut sw = 0u32;
