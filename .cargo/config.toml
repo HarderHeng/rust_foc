@@ -9,3 +9,7 @@ rustflags = [
 
 [build]
 target = "thumbv7em-none-eabihf"
+
+# Compile-time defmt filter. Unset means all `defmt::*` macros are stripped.
+[env]
+DEFMT_LOG = "info"
