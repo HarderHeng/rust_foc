@@ -451,6 +451,7 @@ impl Shell {
         match toks.next() {
             Some("status") => {
                 let s = control::snapshot();
+                let isr = app::telemetry::isr_snapshot();
                 let _ = self.write_all(b"foc ").await;
                 let _ = self.write_all(s.mode.as_str().as_bytes()).await;
                 let _ = self.write_all(b" id_ma=").await;
@@ -486,10 +487,15 @@ impl Shell {
                 let _ = self.write_all(b" vbus=").await;
                 let _ = self.write_i32(app::vbus_mv() as i32).await;
                 let _ = self.write_all(b" mV isr=").await;
-                let _ = self.write_i32(app::isr_us() as i32).await;
+                let _ = self
+                    .write_u32(app::telemetry::cycles_to_us(isr.last_cycles))
+                    .await;
                 let _ = self.write_all(b"/").await;
-                let _ = self.write_i32(app::isr_us_max() as i32).await;
-                let _ = self.write_all(b" us").await;
+                let _ = self
+                    .write_u32(app::telemetry::cycles_to_us(isr.max_cycles))
+                    .await;
+                let _ = self.write_all(b" us over=").await;
+                let _ = self.write_u32(isr.overruns).await;
                 if s.mode == control::Mode::Align {
                     let _ = self.write_all(b" align_left=").await;
                     let _ = self.write_i32(control::align_left_ms() as i32).await;
@@ -501,7 +507,10 @@ impl Shell {
                 if control::mode() == control::Mode::Fault {
                     let _ = self.write_all(b"blocked: fault (foc stop)\r\n").await;
                 } else {
-                    control::start();
+                    if !control::start() {
+                        self.write_blocked().await;
+                        return;
+                    }
                     let _ = self.write_all(b"current loop ON\r\n").await;
                 }
             }
@@ -514,7 +523,10 @@ impl Shell {
                     let _ = self.write_all(b"blocked: fault (foc stop)\r\n").await;
                 } else {
                     let id = parse_i32(toks.next());
-                    control::request_align(id);
+                    if !control::request_align(id) {
+                        self.write_blocked().await;
+                        return;
+                    }
                     let _ = self.write_all(b"align id=").await;
                     let _ = self.write_i32(control::id_target_ma()).await;
                     let _ = self.write_all(b" mA hold=").await;
@@ -546,7 +558,10 @@ impl Shell {
             },
             Some("poles") => match parse_u8(toks.next()) {
                 Some(n) => {
-                    control::set_poles(n);
+                    if !control::set_poles(n) {
+                        self.write_blocked().await;
+                        return;
+                    }
                     let _ = self.write_all(b"poles=").await;
                     let _ = self.write_i32(control::poles() as i32).await;
                     let _ = self.write_all(b"\r\n").await;
@@ -563,7 +578,10 @@ impl Shell {
                 }
                 Some(s) => match parse_i32(Some(s)) {
                     Some(mrad) => {
-                        control::set_theta_e_off_mrad(mrad);
+                        if !control::set_theta_e_off_mrad(mrad) {
+                            self.write_blocked().await;
+                            return;
+                        }
                         let _ = self.write_all(b"theta_e_off=").await;
                         let _ = self.write_i32(control::theta_e_off_mrad()).await;
                         let _ = self.write_all(b" mrad ").await;
@@ -579,7 +597,10 @@ impl Shell {
                     if control::mode() == control::Mode::Fault {
                         let _ = self.write_all(b"blocked: fault (foc stop)\r\n").await;
                     } else {
-                        control::start_speed(rpm);
+                        if !control::start_speed(rpm) {
+                            self.write_blocked().await;
+                            return;
+                        }
                         let _ = self.write_all(b"speed rpm_tgt=").await;
                         let _ = self.write_i32(control::rpm_target()).await;
                         let _ = self.write_all(b"\r\n").await;
@@ -598,7 +619,10 @@ impl Shell {
                     if control::mode() == control::Mode::Fault {
                         let _ = self.write_all(b"blocked: fault (foc stop)\r\n").await;
                     } else {
-                        control::start_openloop(vq_mv, hz);
+                        if !control::start_openloop(vq_mv, hz) {
+                            self.write_blocked().await;
+                            return;
+                        }
                         let _ = self.write_all(b"openloop vq=").await;
                         let _ = self.write_i32(control::ol_vq_mv()).await;
                         let _ = self.write_all(b" mV  ").await;
@@ -617,7 +641,10 @@ impl Shell {
             Some("skp") => self.cmd_gain("skp", toks.next(), false, true).await,
             Some("ski") => self.cmd_gain("ski", toks.next(), false, false).await,
             Some("zero") => {
-                control::capture_electrical_offset();
+                if !control::capture_electrical_offset() {
+                    self.write_blocked().await;
+                    return;
+                }
                 let _ = self.write_all(b"theta_e_off=").await;
                 let _ = self.write_i32(control::theta_e_off_mrad()).await;
                 let _ = self.write_all(b" mrad ").await;
@@ -627,18 +654,30 @@ impl Shell {
                 self.write_nvm_result().await;
             }
             Some("isr") => {
-                let _ = self.write_all(b"isr last=").await;
-                let _ = self.write_i32(app::isr_us() as i32).await;
+                // One snapshot before any UART await; counters cannot come from different windows.
+                let isr = app::telemetry::isr_snapshot();
+                let _ = self.write_all(b"isr handler last=").await;
+                let _ = self
+                    .write_u32(app::telemetry::cycles_to_us(isr.last_cycles))
+                    .await;
                 let _ = self.write_all(b" us max=").await;
-                let _ = self.write_i32(app::isr_us_max() as i32).await;
+                let _ = self
+                    .write_u32(app::telemetry::cycles_to_us(isr.max_cycles))
+                    .await;
                 let _ = self.write_all(b" us cyc=").await;
-                let _ = self.write_i32(app::isr_cycles() as i32).await;
+                let _ = self.write_u32(isr.last_cycles).await;
                 let _ = self.write_all(b"/").await;
-                let _ = self.write_i32(app::isr_cycles_max() as i32).await;
+                let _ = self.write_u32(isr.max_cycles).await;
+                let _ = self.write_all(b" budget_cyc=").await;
+                let _ = self.write_u32(app::telemetry::ISR_BUDGET_CYCLES).await;
+                let _ = self.write_all(b" calls=").await;
+                let _ = self.write_u32(isr.calls).await;
+                let _ = self.write_all(b" over=").await;
+                let _ = self.write_u32(isr.overruns).await;
                 let _ = self.write_all(b"\r\n").await;
                 if toks.next() == Some("reset") {
                     app::reset_isr_cycles();
-                    let _ = self.write_all(b"isr max cleared\r\n").await;
+                    let _ = self.write_all(b"isr counters cleared\r\n").await;
                 }
             }
             Some("motor") => {
@@ -682,7 +721,10 @@ impl Shell {
             }
             Some("pwm") => match parse_u8(toks.next()) {
                 Some(pct) => {
-                    control::set_pwm_pct(pct);
+                    if !control::set_pwm_pct(pct) {
+                        self.write_blocked().await;
+                        return;
+                    }
                     let _ = self.write_all(b"duty=").await;
                     let _ = self.write_i32(control::pwm_pct() as i32).await;
                     let _ = self.write_all(b"%\r\n").await;
@@ -752,6 +794,14 @@ impl Shell {
         let _ = self.write_all(b"\r\n").await;
     }
 
+    async fn write_blocked(&mut self) {
+        let _ = self
+            .write_all(
+                b"blocked: foc stop first; check fresh VBUS/NTC/encoder and fault status\r\n",
+            )
+            .await;
+    }
+
     async fn write_nvm_result(&mut self) {
         if control::persist_nvm() {
             let _ = self.write_all(b"nvm=ok\r\n").await;
@@ -770,6 +820,21 @@ impl Shell {
         let mut buf = [0u8; 12];
         let n = fmt_i32(v, &mut buf);
         self.write_all(&buf[..n]).await
+    }
+
+    async fn write_u32(&mut self, mut v: u32) -> Result<(), ()> {
+        // Diagnostics saturate at u32::MAX; do not render them as negative i32s.
+        let mut buf = [0u8; 10];
+        let mut start = buf.len();
+        loop {
+            start -= 1;
+            buf[start] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        self.write_all(&buf[start..]).await
     }
 
     async fn write_f32(&mut self, v: f32) -> Result<(), ()> {

@@ -6,7 +6,7 @@ use micromath::F32Ext;
 use super::pid::Pi;
 use super::svm::{Svpwm, VdPriority};
 use super::traits::{Modulator, PhaseCurrents, Regulator, VoltageFeedforward, VoltageLimiter};
-use super::transforms::{clarke, inv_park, park};
+use super::transforms::{clarke, inv_park, Rotation};
 use super::types::{Dq, Duties};
 
 /// PMSM d/q voltage feed-forward (ST MCWB `FF_VqdffComputation`).
@@ -134,7 +134,8 @@ impl<R: Regulator, M: Modulator, L: VoltageLimiter> CurrentLoop<R, M, L> {
         Regulator::set_limits(&mut self.id, -lim, lim);
         Regulator::set_limits(&mut self.iq, -lim, lim);
 
-        let meas = park(clarke(i.abc()), theta_e);
+        let rotation = Rotation::new(theta_e);
+        let meas = rotation.park(clarke(i.abc()));
         let vd_pi = Regulator::step(&mut self.id, refs.d - meas.d, dt);
         let vq_pi = Regulator::step(&mut self.iq, refs.q - meas.q, dt);
 
@@ -150,7 +151,7 @@ impl<R: Regulator, M: Modulator, L: VoltageLimiter> CurrentLoop<R, M, L> {
             Regulator::track(&mut self.iq, voltage.q - ff.q);
         }
 
-        let duties = self.modulator.modulate(inv_park(voltage, theta_e), vbus);
+        let duties = self.modulator.modulate(rotation.inv_park(voltage), vbus);
         CurrentStep {
             meas,
             voltage_ref,
@@ -191,6 +192,47 @@ mod tests {
         let i0 = l.id.integrator();
         let (_m, _) = l.step((0.0, 0.0), refs, 0.0, 24.0, 0.001, Dq::default());
         assert!((l.id.integrator() - i0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn shared_rotation_preserves_current_loop_outputs_at_nonzero_angles() {
+        let currents = (0.03, -0.01);
+        let ab = clarke(currents.abc());
+        let refs = Dq { d: 0.1, q: 0.2 };
+        let ff = Dq { d: -0.02, q: 0.03 };
+        let mut loop_ = CurrentLoop::new(1.0, 0.0, 12.0);
+        for i in -16..=16 {
+            let theta = i as f32 * core::f32::consts::TAU / 16.0;
+            // Independent equations of the previous unshared Park/inverse-Park path.
+            let (s, c) = theta.sin_cos();
+            let expected_meas = Dq {
+                d: ab.alpha * c + ab.beta * s,
+                q: -ab.alpha * s + ab.beta * c,
+            };
+            let voltage = Dq {
+                d: refs.d - expected_meas.d + ff.d,
+                q: refs.q - expected_meas.q + ff.q,
+            };
+            let expected = Svpwm.modulate(
+                crate::types::AlphaBeta {
+                    alpha: voltage.d * c - voltage.q * s,
+                    beta: voltage.d * s + voltage.q * c,
+                },
+                24.0,
+            );
+            let out = loop_.step_debug(currents, refs, theta, 24.0, 0.00005, ff);
+            for (got, want) in [
+                (out.meas.d, expected_meas.d),
+                (out.meas.q, expected_meas.q),
+                (out.voltage.d, voltage.d),
+                (out.voltage.q, voltage.q),
+                (out.duties.a, expected.a),
+                (out.duties.b, expected.b),
+                (out.duties.c, expected.c),
+            ] {
+                assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+            }
+        }
     }
 
     #[test]

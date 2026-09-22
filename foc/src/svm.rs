@@ -100,7 +100,13 @@ mod tests {
 
     #[test]
     fn duties_in_unit_interval() {
-        let d = svpwm(AlphaBeta { alpha: 5.0, beta: 2.0 }, 12.0);
+        let d = svpwm(
+            AlphaBeta {
+                alpha: 5.0,
+                beta: 2.0,
+            },
+            12.0,
+        );
         for x in [d.a, d.b, d.c] {
             assert!((0.0..=1.0).contains(&x));
         }
@@ -108,7 +114,13 @@ mod tests {
 
     #[test]
     fn zero_voltage_is_half() {
-        let d = svpwm(AlphaBeta { alpha: 0.0, beta: 0.0 }, 12.0);
+        let d = svpwm(
+            AlphaBeta {
+                alpha: 0.0,
+                beta: 0.0,
+            },
+            12.0,
+        );
         assert!((d.a - 0.5).abs() < 1e-5);
         assert!((d.b - 0.5).abs() < 1e-5);
         assert!((d.c - 0.5).abs() < 1e-5);

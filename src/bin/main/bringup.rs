@@ -42,8 +42,8 @@ pub fn start(p: Peripherals) -> Board {
     stm32g431_foc::driver::nvm::init(p.FLASH);
     stm32g431_foc::app::control::load_nvm();
     analog::init(
-        p.OPAMP1, p.OPAMP2, p.OPAMP3, p.ADC1, p.ADC2, p.PA1, p.PA3, p.PA2, p.PA7, p.PA5, p.PA6, p.PB0,
-        p.PB2, p.PB1, p.PA0, p.PB14,
+        p.OPAMP1, p.OPAMP2, p.OPAMP3, p.ADC1, p.ADC2, p.PA1, p.PA3, p.PA2, p.PA7, p.PA5, p.PA6,
+        p.PB0, p.PB2, p.PB1, p.PA0, p.PB14,
     );
     ocp::init(p.DAC3);
     let _ = with_pwm(|p| p.enable_comp_break());
@@ -51,18 +51,20 @@ pub fn start(p: Peripherals) -> Board {
 
     let button = ExtiInput::new(p.PC10, p.EXTI10, Pull::None, Irqs);
 
-    let i2c = I2c::new(p.I2C1, p.PB8, p.PB7, p.DMA1_CH3, p.DMA1_CH4, Irqs, i2c_config());
+    let i2c = I2c::new(
+        p.I2C1,
+        p.PB8,
+        p.PB7,
+        p.DMA1_CH3,
+        p.DMA1_CH4,
+        Irqs,
+        i2c_config(),
+    );
 
     let mut uart_cfg = UartConfig::default();
     uart_cfg.baudrate = UART_BAUDRATE;
     let uart = Uart::new(
-        p.USART2,
-        p.PB4,
-        p.PB3,
-        p.DMA1_CH1,
-        p.DMA1_CH2,
-        Irqs,
-        uart_cfg,
+        p.USART2, p.PB4, p.PB3, p.DMA1_CH1, p.DMA1_CH2, Irqs, uart_cfg,
     )
     .expect("UART init failed");
     let (uart_tx, rx) = uart.split();

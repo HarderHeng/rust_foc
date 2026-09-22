@@ -13,8 +13,8 @@ Embassy Rust FOC for **STM32G431CB** boards electrically compatible with ST B-G4
 ## Build
 
 ```bash
-cargo check --lib --bins          # thumbv7em-none-eabihf
-cargo htest                       # host unit tests for foc/
+cargo check --lib --bins --locked # thumbv7em-none-eabihf
+cargo htest --locked              # algorithms + host control-state regression tests
 probe-rs run --chip STM32G431CB   # default cargo runner
 ```
 
@@ -33,7 +33,13 @@ foc start
 foc iq 200         # mA, slewed at 10 A/s
 ```
 
-`foc stop` coasts (MOE off). `foc status` keeps the last `fault=` after stop. Align needs a valid AS5600 magnet.
+`foc stop` coasts (MOE off) and clears all current/speed/open-loop targets. `foc status` keeps the last `fault=` after stop. Starts require fresh, in-range VBUS/NTC; Align/Run/Speed also require a valid AS5600 magnet. Change live modes only after `foc stop`. Repeated `foc rpm` commands update the target without restarting the controllers.
+
+VBUS/NTC are sampled while running. Missing bus data trips `fault=adc`; encoder errors trip immediately, and stale samples time out after 20 ms. Pole pairs and offset can only be edited in Idle. Encoder position is single-turn; accumulated turns no longer reduce Park-angle precision.
+
+Id/Iq/RPM ramps retain sub-unit steps instead of rounding every tick. `foc isr` reports the JEOS handler-body last/max cycles, call count and budget overruns; `foc isr reset` clears the measurement window. It includes ADC reads but excludes exception entry/exit and scheduling latency. Park and inverse Park share one sin/cos pair per control step.
+
+See [safety changes and board acceptance checklist](docs/safety-bringup.md) before loaded operation. Host tests cover algorithms and the firmware control state machine with mocked hardware; ADC/PWM timing still requires on-board verification.
 
 ## Modes
 

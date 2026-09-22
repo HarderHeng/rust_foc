@@ -76,7 +76,7 @@ pub const OPENLOOP_HZ_MAX: u8 = 80;
 /// Medium-frequency Id/Iq reference ramp (A/s), independent of the motor file.
 pub const IDQ_RAMP_A_S: f32 = 10.0;
 
-/// Run/Speed: trip if no `iq`/`rpm`/`start` command for this long.
+/// Run with nonzero Id/Iq: trip if no current/start command for this long.
 pub const CMD_TIMEOUT_MS: u32 = 2_000;
 
 /// 122 `DAC_OCP_Threshold` (12-bit DAC counts vs shunt/COMP).
@@ -87,8 +87,10 @@ pub const AS5600_I2C_ADDR: u8 = 0x36;
 pub const AS5600_I2C_HZ: u32 = 400_000;
 /// Target poll period after STATUS+ANGLE (two I2C cycles). ~1.5–2.5 kHz at 400 kHz.
 pub const AS5600_PERIOD_US: u32 = 400;
-/// Run/Speed: trip if no valid magnet/I2C for this long.
+/// Closed-loop modes: maximum age of a valid angle. Explicit I2C/magnet errors trip immediately.
 pub const ENC_FAULT_MS: u32 = 20;
+/// Maximum age of a complete VBUS/NTC pair (normally refreshed every ~2 ms).
+pub const BUS_FAULT_MS: u32 = 20;
 
 pub fn adc_to_amps(counts: u16, offset: u16) -> f32 {
     let volts = (counts as f32 - offset as f32) * (ADC_VREF / ADC_FULL_SCALE);

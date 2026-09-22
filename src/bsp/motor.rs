@@ -18,6 +18,7 @@ pub const MOTOR_FLUX_WB: f32 = 0.003_5;
 /// Nameplate KV (mechanical rpm / V).
 pub const MOTOR_KV: f32 = 220.0;
 /// Optional Ke (Vrms line-line / krpm) if a datasheet gives that instead of ψf.
+#[allow(clippy::approx_constant)] // Motor Ke, not the mathematical constant π.
 pub const MOTOR_KE_VRMS_PER_KRPM: f32 = 3.14;
 /// Software speed clamp (rpm).
 pub const MOTOR_MAX_RPM: u16 = 3000;
@@ -44,7 +45,7 @@ pub const SPEED_IQ_RAMP_A_S: f32 = 0.8;
 pub const SPEED_RPM_WINDOW_S: f32 = 0.1;
 pub const SPEED_IQ_MAX_A: f32 = 0.12;
 pub const SPEED_IQ_MIN_A: f32 = 0.02;
-/// Must be ≥ 500: `approach_i32` at 1 ms otherwise rounds a sub-rpm step to 0.
+/// Stateful fixed-point slew retains sub-RPM steps; small ramp rates are supported.
 pub const SPEED_RAMP_RPM_S: f32 = 800.0;
 pub const SPEED_RPM_MAX: i32 = 8_000;
 pub const RPM_RAMP_RPM_S: f32 = MOTOR_MAX_RPM as f32;

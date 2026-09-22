@@ -10,10 +10,9 @@ use crate::bsp::config::{
 };
 use crate::driver::analog::AnalogSample;
 use crate::driver::pwm::with_pwm;
-use crate::foc::current::openloop_voltage;
-use crate::foc::transforms::{clarke, park, wrap_2pi};
+use crate::foc::transforms::{clarke, wrap_2pi, Rotation};
 use crate::foc::{
-    park_theta, CurrentLoop, Dq, DqFf, DutySink, FfOff, PhaseCurrents, VoltageFeedforward,
+    CurrentLoop, Dq, DqFf, DutySink, FfOff, Modulator, PhaseCurrents, Svpwm, VoltageFeedforward,
 };
 
 static LOOP: StaticCell<CurrentLoop> = StaticCell::new();
@@ -43,14 +42,16 @@ pub fn set_gains(kp: f32, ki: f32) {
     with_loop(|l| l.set_gains(kp, ki));
 }
 
+/// Timing is owned by the IRQ wrapper so it also includes ADC reads and flag handling.
 pub fn on_injected(s: AnalogSample) {
-    let t0 = cortex_m::peripheral::DWT::cycle_count();
-    on_injected_inner(s);
-    telemetry::publish_isr_cycles(cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0));
-}
-
-fn on_injected_inner(s: AnalogSample) {
     telemetry::publish_currents(s);
+
+    if control::outputs_live() {
+        if let Some(kind) = control::sensor_fault(control::mode()) {
+            control::fault(kind);
+            return;
+        }
+    }
 
     if s.iu_a.abs() > SW_OCP_A || s.iv_a.abs() > SW_OCP_A || s.iw_a.abs() > SW_OCP_A {
         control::fault(control::FaultKind::Overcurrent);
@@ -65,12 +66,8 @@ fn on_injected_inner(s: AnalogSample) {
 }
 
 fn vbus_v() -> f32 {
-    let mv = telemetry::vbus_mv();
-    if mv == 0 {
-        NOMINAL_VBUS_V
-    } else {
-        mv as f32 / 1000.0
-    }
+    // on_injected rejects missing, stale and out-of-range bus samples.
+    telemetry::vbus_mv() as f32 / 1000.0
 }
 
 fn openloop_step(s: AnalogSample) {
@@ -79,7 +76,8 @@ fn openloop_step(s: AnalogSample) {
     let th = wrap_2pi(f32::from_bits(OL_THETA_BITS.load(Ordering::Relaxed)) + dth);
     OL_THETA_BITS.store(th.to_bits(), Ordering::Relaxed);
 
-    let meas = park(clarke(s.abc()), th);
+    let rotation = Rotation::new(th);
+    let meas = rotation.park(clarke(s.abc()));
     telemetry::publish_dq(meas);
 
     let voltage = Dq {
@@ -90,27 +88,24 @@ fn openloop_step(s: AnalogSample) {
 
     // Open-loop: do not use current-sign dead-time. Offset/noise flips the
     // sign every ISR and adds ~1.5% duty chatter (felt as strong cogging).
-    let duties = openloop_voltage(voltage.d, voltage.q, th, vbus);
+    let duties = Svpwm.modulate(rotation.inv_park(voltage), vbus);
     telemetry::publish_duties(duties);
     apply_duties(duties);
 }
 
 fn step(s: AnalogSample) {
-    if telemetry::vbus_mv() == 0 {
-        return;
-    }
     let vbus = vbus_v();
 
     let theta_e = if control::mode() == control::Mode::Align {
         // Forced D-axis: Park at 0 until `poll_align` latches the encoder offset.
         0.0
     } else {
-        let (theta_m, valid) = telemetry::theta_m_predict(CURRENT_LOOP_TS);
-        if !valid {
-            // Hold last CCR. Encoder task trips after a grace window.
+        let Some(theta) = telemetry::electrical_angle(control::theta_e_off(), control::poles())
+        else {
+            control::fault(control::FaultKind::Encoder);
             return;
-        }
-        park_theta(theta_m, control::theta_e_off(), control::poles())
+        };
+        theta
     };
 
     let refs = Dq {

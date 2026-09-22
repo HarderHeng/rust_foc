@@ -2,21 +2,22 @@
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use embassy_stm32::Peri;
 use embassy_stm32::gpio::{OutputType, Pull, Speed};
-use embassy_stm32::pac::TIM1 as TIM1_PAC;
 use embassy_stm32::pac::timer::vals::Ocm;
-use embassy_stm32::peripherals::{PA8, PA9, PA10, PA12, PB15, PC13, TIM1};
+use embassy_stm32::pac::TIM1 as TIM1_PAC;
+use embassy_stm32::peripherals::{PA10, PA12, PA8, PA9, PB15, PC13, TIM1};
 use embassy_stm32::time::Hertz;
-use embassy_stm32::timer::Channel;
 use embassy_stm32::timer::complementary_pwm::{
-    BreakComparatorPolarity, BreakInputPolarity, ComplementaryPwm, ComplementaryPwmPin, FilterValue, Mms2, Ossi, Ossr,
+    BreakComparatorPolarity, BreakInputPolarity, ComplementaryPwm, ComplementaryPwmPin,
+    FilterValue, Mms2, Ossi, Ossr,
 };
 use embassy_stm32::timer::low_level::{CountingMode, MasterMode};
 use embassy_stm32::timer::simple_pwm::{PwmPin, PwmPinConfig};
+use embassy_stm32::timer::Channel;
+use embassy_stm32::Peri;
 use static_cell::StaticCell;
 
-use crate::bsp::config::{PWM_FREQ_HZ, pwm_deadtime_ticks, tw_after_ticks, tw_before_ticks};
+use crate::bsp::config::{pwm_deadtime_ticks, tw_after_ticks, tw_before_ticks, PWM_FREQ_HZ};
 use crate::foc::{Duties, DutySink};
 
 static PWM: StaticCell<MotorPwm> = StaticCell::new();
@@ -101,11 +102,15 @@ impl MotorPwm {
 
         let max_duty = inner.get_max_duty();
         // 122: CH4 is PWM2, TRGO = OC4REF. Rising edge near the counter peak.
-        TIM1_PAC.ccmr_output(1).modify(|w| w.set_ocm(1, Ocm::PWM_MODE2));
+        TIM1_PAC
+            .ccmr_output(1)
+            .modify(|w| w.set_ocm(1, Ocm::PWM_MODE2));
         inner.set_duty(Channel::Ch4, max_duty.saturating_sub(1));
         // CC4E only (no CH4N pin). 122 R3_2 enables CH4 so TIM1_CH4 can trigger injected ADC.
         TIM1_PAC.ccer().modify(|w| w.set_cce(3, true));
-        TIM1_PAC.cr2().modify(|w| w.set_mms(MasterMode::COMPARE_OC4));
+        TIM1_PAC
+            .cr2()
+            .modify(|w| w.set_mms(MasterMode::COMPARE_OC4));
         inner.set_mms2(Mms2::RESET);
 
         let mid = max_duty / 2;
@@ -130,7 +135,8 @@ impl MotorPwm {
         self.inner.set_break_comparator_enable(0, true);
         self.inner.set_break_comparator_enable(1, true);
         self.inner.set_break_comparator_enable(3, true);
-        self.inner.set_break_polarity(BreakInputPolarity::ACTIVE_HIGH);
+        self.inner
+            .set_break_polarity(BreakInputPolarity::ACTIVE_HIGH);
         self.inner.set_break_filter(FilterValue::FDTS_DIV2_N6);
         self.inner.set_automatic_output_enable(false);
         self.inner.set_break_enable(true);
@@ -151,8 +157,21 @@ impl MotorPwm {
         ]
     }
 
-    pub fn enable(&mut self) {
+    /// Arm only after safe CCR values have been transferred to the active registers.
+    /// A pending hardware break must be serviced, never cleared by a start request.
+    pub fn prepare_start(&mut self, duties: Duties) -> bool {
+        self.disable();
+        if TIM1_PAC.sr().read().bif(0) {
+            return false;
+        }
+        self.set_duties(duties);
+        TIM1_PAC.egr().write(|r| r.set_ug(true));
         self.inner.set_master_output_enable(true);
+        if TIM1_PAC.sr().read().bif(0) {
+            self.disable();
+            return false;
+        }
+        self.is_enabled()
     }
 
     pub fn disable(&mut self) {

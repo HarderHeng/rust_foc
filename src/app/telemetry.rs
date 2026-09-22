@@ -1,17 +1,32 @@
-//! Sensor snapshot shared with the shell and (later) the current ISR.
+//! Sensor snapshots and current-IRQ diagnostics shared with the shell.
 
+use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicU16, AtomicU32, Ordering};
+use cortex_m::interrupt::Mutex;
+use embassy_time::Instant;
 
-use crate::bsp::config::SYSCLK_FREQ_HZ;
+use crate::bsp::config::{BUS_FAULT_MS, ENC_FAULT_MS, PWM_FREQ_HZ, SYSCLK_FREQ_HZ};
 use crate::driver::analog::AnalogSample;
+use crate::foc::safety::Freshness;
+use crate::foc::timing::CycleStats;
 
 static ENC_RAW: AtomicU16 = AtomicU16::new(0);
 static ENC_VALID: AtomicBool = AtomicBool::new(false);
 static ENC_MDEG: AtomicI32 = AtomicI32::new(0);
 static ENC_THETA_BITS: AtomicU32 = AtomicU32::new(0);
 static ENC_OMEGA_MRAD: AtomicI32 = AtomicI32::new(0);
-/// PWM-period ticks since the last valid `publish_angle` (ISR increments).
-static ENC_AGE_TICKS: AtomicU32 = AtomicU32::new(0);
+static ENC_AGE: Mutex<Cell<Freshness>> = Mutex::new(Cell::new(Freshness::new()));
+static BUS_AGE: Mutex<Cell<Freshness>> = Mutex::new(Cell::new(Freshness::new()));
+
+fn sample_fresh(age: &Mutex<Cell<Freshness>>, timeout_ms: u32) -> bool {
+    cortex_m::interrupt::free(|cs| {
+        let cell = age.borrow(cs);
+        let mut stamp = cell.get();
+        let fresh = stamp.is_fresh(Instant::now().as_millis() as u32, timeout_ms);
+        cell.set(stamp);
+        fresh
+    })
+}
 static RPM_RAW_INIT: AtomicBool = AtomicBool::new(false);
 static RPM_LAST_RAW: AtomicU16 = AtomicU16::new(0);
 static RPM_ACC_COUNTS: AtomicI32 = AtomicI32::new(0);
@@ -20,32 +35,46 @@ static RPM_F_BITS: AtomicU32 = AtomicU32::new(0.0f32.to_bits());
 static RPM_READY: AtomicBool = AtomicBool::new(false);
 
 pub fn publish_angle(raw: u16, theta_m: f32, omega_m: f32, valid: bool) {
-    ENC_VALID.store(valid, Ordering::Relaxed);
-    if !valid {
-        return;
-    }
-    ENC_RAW.store(raw, Ordering::Relaxed);
-    ENC_THETA_BITS.store(theta_m.to_bits(), Ordering::Relaxed);
-    ENC_MDEG.store(
-        (theta_m * 180_000.0 / core::f32::consts::PI) as i32,
-        Ordering::Relaxed,
-    );
-    ENC_OMEGA_MRAD.store((omega_m * 1000.0) as i32, Ordering::Relaxed);
-    ENC_AGE_TICKS.store(0, Ordering::Release);
+    let valid = valid && theta_m.is_finite() && omega_m.is_finite();
+    cortex_m::interrupt::free(|cs| {
+        ENC_VALID.store(valid, Ordering::Relaxed);
+        if !valid {
+            // Fail closed: do not keep applying the previous voltage on I2C errors.
+            ENC_AGE.borrow(cs).set(Freshness::new());
+            return;
+        }
+        ENC_RAW.store(raw & 0x0fff, Ordering::Relaxed);
+        ENC_THETA_BITS.store(theta_m.to_bits(), Ordering::Relaxed);
+        ENC_MDEG.store(
+            (theta_m * 180_000.0 / core::f32::consts::PI) as i32,
+            Ordering::Relaxed,
+        );
+        ENC_OMEGA_MRAD.store((omega_m * 1000.0) as i32, Ordering::Relaxed);
+        let mut age = Freshness::new();
+        age.refresh(Instant::now().as_millis() as u32);
+        ENC_AGE.borrow(cs).set(age);
+    });
 }
 
 /// Last I2C sample. Do not extrapolate with the 12-bit ω estimate — it chatters
 /// at low speed and rotates the Park frame as if the rotor were shaking.
 pub fn theta_m_sample() -> (f32, bool) {
-    (
-        f32::from_bits(ENC_THETA_BITS.load(Ordering::Relaxed)),
-        enc_valid(),
-    )
+    cortex_m::interrupt::free(|_| {
+        (
+            f32::from_bits(ENC_THETA_BITS.load(Ordering::Relaxed)),
+            enc_valid(),
+        )
+    })
 }
 
-/// Age the sample counter; Park uses the last sample, not `θ + ω·age`.
+/// Coherent raw-angle/validity snapshot; the clock advances even if the encoder task stalls.
+pub fn electrical_angle(offset: f32, poles: u8) -> Option<f32> {
+    let (raw, valid) = cortex_m::interrupt::free(|_| (enc_raw(), enc_valid()));
+    valid.then(|| crate::foc::angle::park_theta_raw(raw, offset, poles))
+}
+
+/// Compatibility accessor: zero-order hold with a wall-clock freshness check.
 pub fn theta_m_predict(_dt: f32) -> (f32, bool) {
-    ENC_AGE_TICKS.fetch_add(1, Ordering::Relaxed);
     theta_m_sample()
 }
 
@@ -63,7 +92,9 @@ pub fn enc_raw() -> u16 {
 }
 
 pub fn enc_valid() -> bool {
-    ENC_VALID.load(Ordering::Relaxed)
+    cortex_m::interrupt::free(|_| {
+        ENC_VALID.load(Ordering::Relaxed) && sample_fresh(&ENC_AGE, ENC_FAULT_MS)
+    })
 }
 
 pub fn enc_mdeg() -> i32 {
@@ -88,8 +119,9 @@ static UD_MV: AtomicI16 = AtomicI16::new(0);
 static UQ_MV: AtomicI16 = AtomicI16::new(0);
 static UD_REF_MV: AtomicI16 = AtomicI16::new(0);
 static UQ_REF_MV: AtomicI16 = AtomicI16::new(0);
-static ISR_CYCLES: AtomicU32 = AtomicU32::new(0);
-static ISR_CYCLES_MAX: AtomicU32 = AtomicU32::new(0);
+static ISR_STATS: Mutex<Cell<CycleStats>> = Mutex::new(Cell::new(CycleStats::new()));
+/// One PWM period, not an allowance for exception entry/exit or scheduling latency.
+pub const ISR_BUDGET_CYCLES: u32 = SYSCLK_FREQ_HZ / PWM_FREQ_HZ;
 static DA_PPT: AtomicU16 = AtomicU16::new(0);
 static DB_PPT: AtomicU16 = AtomicU16::new(0);
 static DC_PPT: AtomicU16 = AtomicU16::new(0);
@@ -109,8 +141,24 @@ pub fn publish_currents(s: AnalogSample) {
 }
 
 pub fn publish_bus(s: AnalogSample) {
-    VBUS_MV.store((s.vbus_v * 1000.0) as u16, Ordering::Relaxed);
-    TEMP_C10.store((s.temp_c * 10.0) as i16, Ordering::Relaxed);
+    cortex_m::interrupt::free(|cs| {
+        VBUS_MV.store((s.vbus_v * 1000.0) as u16, Ordering::Relaxed);
+        TEMP_C10.store((s.temp_c * 10.0) as i16, Ordering::Relaxed);
+        let mut age = Freshness::new();
+        if s.vbus_v.is_finite() && s.temp_c.is_finite() {
+            age.refresh(s.bus_sampled_at_ms);
+        }
+        BUS_AGE.borrow(cs).set(age);
+    });
+}
+
+pub fn invalidate_bus() {
+    cortex_m::interrupt::free(|cs| BUS_AGE.borrow(cs).set(Freshness::new()));
+}
+
+/// VBUS, temperature, and freshness from the same publication.
+pub fn bus_snapshot() -> (u16, i16, bool) {
+    cortex_m::interrupt::free(|_| (vbus_mv(), temp_c10(), sample_fresh(&BUS_AGE, BUS_FAULT_MS)))
 }
 
 pub fn publish_dq(dq: crate::foc::Dq) {
@@ -147,26 +195,37 @@ fn volts_to_mv_i16(v: f32) -> i16 {
     mv.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
-/// Last JEOS ISR duration in CPU cycles (no defmt / no RTT in that path).
-pub fn publish_isr_cycles(cycles: u32) {
-    ISR_CYCLES.store(cycles, Ordering::Relaxed);
-    let _ = ISR_CYCLES_MAX.fetch_max(cycles, Ordering::Relaxed);
+/// Record the JEOS handler body: flag handling + ADC reads + current control.
+/// Excludes exception entry/exit, time waiting to enter the handler, and this
+/// statistics publication. Includes any higher-priority IRQ that preempts it.
+/// No logging or floating-point formatting in this path.
+pub fn publish_isr_timing(start: u32, end: u32) {
+    cortex_m::interrupt::free(|cs| {
+        let cell = ISR_STATS.borrow(cs);
+        let mut stats = cell.get();
+        stats.record(start, end, ISR_BUDGET_CYCLES);
+        cell.set(stats);
+    });
+}
+
+pub fn isr_snapshot() -> CycleStats {
+    cortex_m::interrupt::free(|cs| ISR_STATS.borrow(cs).get())
 }
 
 pub fn isr_cycles() -> u32 {
-    ISR_CYCLES.load(Ordering::Relaxed)
+    isr_snapshot().last_cycles
 }
 
 pub fn isr_cycles_max() -> u32 {
-    ISR_CYCLES_MAX.load(Ordering::Relaxed)
+    isr_snapshot().max_cycles
 }
 
+/// Clear the complete window atomically with respect to the ADC interrupt.
 pub fn reset_isr_cycles() {
-    ISR_CYCLES.store(0, Ordering::Relaxed);
-    ISR_CYCLES_MAX.store(0, Ordering::Relaxed);
+    cortex_m::interrupt::free(|cs| ISR_STATS.borrow(cs).set(CycleStats::new()));
 }
 
-fn cycles_to_us(cycles: u32) -> u32 {
+pub fn cycles_to_us(cycles: u32) -> u32 {
     cycles / (SYSCLK_FREQ_HZ / 1_000_000)
 }
 
@@ -237,16 +296,23 @@ pub fn rpm_ready() -> bool {
 }
 
 pub fn reset_speed_filter() {
-    RPM_RAW_INIT.store(false, Ordering::Relaxed);
-    RPM_ACC_COUNTS.store(0, Ordering::Relaxed);
-    RPM_WIN_US.store(0, Ordering::Relaxed);
-    RPM_F_BITS.store(0.0f32.to_bits(), Ordering::Relaxed);
-    RPM_READY.store(false, Ordering::Relaxed);
+    cortex_m::interrupt::free(|_| {
+        RPM_RAW_INIT.store(false, Ordering::Relaxed);
+        RPM_ACC_COUNTS.store(0, Ordering::Relaxed);
+        RPM_WIN_US.store(0, Ordering::Relaxed);
+        RPM_F_BITS.store(0.0f32.to_bits(), Ordering::Relaxed);
+        RPM_READY.store(false, Ordering::Relaxed);
+    });
 }
 
 /// 12-bit wrap-aware Δraw over [`crate::bsp::config::SPEED_RPM_WINDOW_S`].
 /// Unwrapped `θ` can accumulate encoder chatter into a fake high rpm.
 pub fn push_speed_from_raw(raw: u16, dt: f32) {
+    // A fault ISR may reset this filter; never publish half of a pre-reset update.
+    cortex_m::interrupt::free(|_| push_speed_inner(raw, dt));
+}
+
+fn push_speed_inner(raw: u16, dt: f32) {
     use crate::bsp::config::SPEED_RPM_WINDOW_S;
     let raw = raw & 0x0FFF;
     let dt = dt.max(1e-5);
@@ -257,12 +323,7 @@ pub fn push_speed_from_raw(raw: u16, dt: f32) {
         return;
     }
     let prev = RPM_LAST_RAW.swap(raw, Ordering::Relaxed);
-    let mut d = i32::from(raw) - i32::from(prev);
-    if d > 2048 {
-        d -= 4096;
-    } else if d < -2048 {
-        d += 4096;
-    }
+    let d = crate::foc::angle::raw_delta(raw, prev);
     RPM_ACC_COUNTS.fetch_add(d, Ordering::Relaxed);
     let us = (dt * 1_000_000.0) as u32;
     let acc = RPM_WIN_US.fetch_add(us, Ordering::Relaxed) + us;

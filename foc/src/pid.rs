@@ -93,6 +93,8 @@ impl Pid {
         Self::pid(kp, ki, 0.0, out_min, out_max)
     }
 
+    // Explicit PI/PID constructors are part of the public regulator API.
+    #[allow(clippy::self_named_constructors)]
     pub fn pid(kp: f32, ki: f32, kd: f32, out_min: f32, out_max: f32) -> Self {
         let (lo, hi) = ordered(out_min, out_max);
         Self {

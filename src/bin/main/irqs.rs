@@ -4,7 +4,7 @@ use embassy_stm32::interrupt::typelevel::Handler;
 use embassy_stm32::interrupt::{self, InterruptExt};
 use embassy_stm32::pac::{ADC1, ADC2, TIM1};
 use embassy_stm32::{bind_interrupts, dma, exti, i2c, peripherals, usart};
-use stm32g431_foc::app::{control, foc_isr};
+use stm32g431_foc::app::{control, foc_isr, telemetry};
 use stm32g431_foc::driver::analog;
 
 pub struct Tim1Brk;
@@ -18,12 +18,17 @@ impl Handler<interrupt::typelevel::TIM1_BRK_TIM15> for Tim1Brk {
 pub struct AdcJeos;
 impl Handler<interrupt::typelevel::ADC1_2> for AdcJeos {
     unsafe fn on_interrupt() {
+        let start = cortex_m::peripheral::DWT::cycle_count();
         if ADC1.isr().read().jeos() {
-            ADC1.isr().modify(|r| r.set_jeos(true));
-            ADC2.isr().modify(|r| r.set_jeos(true));
+            // W1C: preserve regular EOS/EOC for the nonblocking bus sampler.
+            ADC1.isr().write(|r| r.set_jeos(true));
+            ADC2.isr().write(|r| r.set_jeos(true));
             if let Some(s) = analog::with_analog(|a| a.read_currents()) {
                 foc_isr::on_injected(s);
             }
+            // Also records early-return fault/idle paths and unavailable samples.
+            let end = cortex_m::peripheral::DWT::cycle_count();
+            telemetry::publish_isr_timing(start, end);
         }
     }
 }

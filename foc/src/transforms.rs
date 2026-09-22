@@ -33,20 +33,43 @@ pub fn clarke_two_phase(ia: f32, ib: f32) -> AlphaBeta {
     })
 }
 
-pub fn park(ab: AlphaBeta, theta: f32) -> Dq {
-    let (s, c) = theta.sin_cos();
-    Dq {
-        d: ab.alpha * c + ab.beta * s,
-        q: -ab.alpha * s + ab.beta * c,
+/// One electrical-angle sin/cos pair, shared by Park and inverse Park for a step.
+#[derive(Clone, Copy)]
+pub struct Rotation {
+    sin: f32,
+    cos: f32,
+}
+
+impl Rotation {
+    #[inline]
+    pub fn new(theta: f32) -> Self {
+        let (sin, cos) = theta.sin_cos();
+        Self { sin, cos }
+    }
+
+    #[inline]
+    pub fn park(self, ab: AlphaBeta) -> Dq {
+        Dq {
+            d: ab.alpha * self.cos + ab.beta * self.sin,
+            q: -ab.alpha * self.sin + ab.beta * self.cos,
+        }
+    }
+
+    #[inline]
+    pub fn inv_park(self, dq: Dq) -> AlphaBeta {
+        AlphaBeta {
+            alpha: dq.d * self.cos - dq.q * self.sin,
+            beta: dq.d * self.sin + dq.q * self.cos,
+        }
     }
 }
 
+pub fn park(ab: AlphaBeta, theta: f32) -> Dq {
+    Rotation::new(theta).park(ab)
+}
+
 pub fn inv_park(dq: Dq, theta: f32) -> AlphaBeta {
-    let (s, c) = theta.sin_cos();
-    AlphaBeta {
-        alpha: dq.d * c - dq.q * s,
-        beta: dq.d * s + dq.q * c,
-    }
+    Rotation::new(theta).inv_park(dq)
 }
 
 pub fn inv_clarke(ab: AlphaBeta) -> PhaseAbc {
@@ -95,6 +118,26 @@ mod tests {
         let back = inv_park(dq, th);
         close(back.alpha, ab.alpha);
         close(back.beta, ab.beta);
+    }
+
+    #[test]
+    fn shared_rotation_matches_original_equations_over_a_revolution() {
+        let ab = AlphaBeta {
+            alpha: 3.2,
+            beta: -1.7,
+        };
+        let voltage = Dq { d: -2.3, q: 5.1 };
+        for i in -256..=256 {
+            let theta = i as f32 * core::f32::consts::TAU / 256.0;
+            let (s, c) = theta.sin_cos();
+            let rotation = Rotation::new(theta);
+            let dq = rotation.park(ab);
+            close(dq.d, ab.alpha * c + ab.beta * s);
+            close(dq.q, -ab.alpha * s + ab.beta * c);
+            let out = rotation.inv_park(voltage);
+            close(out.alpha, voltage.d * c - voltage.q * s);
+            close(out.beta, voltage.d * s + voltage.q * c);
+        }
     }
 
     #[test]

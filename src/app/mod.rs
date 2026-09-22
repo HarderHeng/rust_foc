@@ -15,8 +15,7 @@ pub use control::{
 };
 pub use telemetry::{
     da_ppt, db_ppt, dc_ppt, enc_mdeg, enc_omega_mrad, enc_raw, enc_valid, id_meas_ma, iq_meas_ma,
-    isr_cycles,
-    isr_cycles_max, isr_us, isr_us_max, iu_ma, iu_raw, iv_ma, iv_raw, iw_ma, iw_raw,
+    isr_cycles, isr_cycles_max, isr_us, isr_us_max, iu_ma, iu_raw, iv_ma, iv_raw, iw_ma, iw_raw,
     publish_analog, publish_angle, publish_bus, publish_currents, publish_dq, publish_vdq,
     reset_isr_cycles, rpm_meas, temp_c10, theta_m_predict, theta_m_sample, ud_mv, ud_ref_mv, uq_mv,
     uq_ref_mv, vbus_mv,

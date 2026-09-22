@@ -5,9 +5,11 @@
 pub mod angle;
 pub mod current;
 pub mod pid;
+pub mod safety;
 pub mod slew;
 pub mod speed;
 pub mod svm;
+pub mod timing;
 pub mod traits;
 pub mod transforms;
 pub mod types;
@@ -18,7 +20,7 @@ pub use current::{
     FfOff,
 };
 pub use pid::{AntiWindup, Pi, Pid, PidIn};
-pub use slew::{approach, approach_i32};
+pub use slew::{approach, approach_i32, SlewI32};
 pub use speed::SpeedLoop;
 pub use svm::{CircleLimit, DeadTime, Svpwm, VdPriority};
 pub use traits::{
