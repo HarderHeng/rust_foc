@@ -55,8 +55,10 @@ pub fn start(p: Peripherals) -> Board {
         p.I2C1,
         p.PB8,
         p.PB7,
-        p.DMA1_CH3,
+        // Embassy order is TX then RX. On STM32G431 I2C1_TX=CH4,
+        // I2C1_RX=CH3.
         p.DMA1_CH4,
+        p.DMA1_CH3,
         Irqs,
         i2c_config(),
     );
