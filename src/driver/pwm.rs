@@ -103,6 +103,8 @@ impl MotorPwm {
         // 122: CH4 is PWM2, TRGO = OC4REF. Rising edge near the counter peak.
         TIM1_PAC.ccmr_output(1).modify(|w| w.set_ocm(1, Ocm::PWM_MODE2));
         inner.set_duty(Channel::Ch4, max_duty.saturating_sub(1));
+        // CC4E only (no CH4N pin). 122 R3_2 enables CH4 so TIM1_CH4 can trigger injected ADC.
+        TIM1_PAC.ccer().modify(|w| w.set_cce(3, true));
         TIM1_PAC.cr2().modify(|w| w.set_mms(MasterMode::COMPARE_OC4));
         inner.set_mms2(Mms2::RESET);
 
@@ -137,6 +139,16 @@ impl MotorPwm {
 
     pub fn max_duty(&self) -> u32 {
         self.max_duty
+    }
+
+    /// Live TIM1 CCR1..4 (counts). For shell/bring-up, not used in the ISR.
+    pub fn read_ccr(&self) -> [u32; 4] {
+        [
+            u32::from(TIM1_PAC.ccr(0).read().ccr()),
+            u32::from(TIM1_PAC.ccr(1).read().ccr()),
+            u32::from(TIM1_PAC.ccr(2).read().ccr()),
+            u32::from(TIM1_PAC.ccr(3).read().ccr()),
+        ]
     }
 
     pub fn enable(&mut self) {

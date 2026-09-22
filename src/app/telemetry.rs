@@ -4,14 +4,20 @@ use core::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicU16, AtomicU32,
 
 use crate::bsp::config::SYSCLK_FREQ_HZ;
 use crate::driver::analog::AnalogSample;
-use crate::foc;
 
 static ENC_RAW: AtomicU16 = AtomicU16::new(0);
 static ENC_VALID: AtomicBool = AtomicBool::new(false);
 static ENC_MDEG: AtomicI32 = AtomicI32::new(0);
+static ENC_THETA_BITS: AtomicU32 = AtomicU32::new(0);
 static ENC_OMEGA_MRAD: AtomicI32 = AtomicI32::new(0);
 /// PWM-period ticks since the last valid `publish_angle` (ISR increments).
 static ENC_AGE_TICKS: AtomicU32 = AtomicU32::new(0);
+static RPM_RAW_INIT: AtomicBool = AtomicBool::new(false);
+static RPM_LAST_RAW: AtomicU16 = AtomicU16::new(0);
+static RPM_ACC_COUNTS: AtomicI32 = AtomicI32::new(0);
+static RPM_WIN_US: AtomicU32 = AtomicU32::new(0);
+static RPM_F_BITS: AtomicU32 = AtomicU32::new(0.0f32.to_bits());
+static RPM_READY: AtomicBool = AtomicBool::new(false);
 
 pub fn publish_angle(raw: u16, theta_m: f32, omega_m: f32, valid: bool) {
     ENC_VALID.store(valid, Ordering::Relaxed);
@@ -19,6 +25,7 @@ pub fn publish_angle(raw: u16, theta_m: f32, omega_m: f32, valid: bool) {
         return;
     }
     ENC_RAW.store(raw, Ordering::Relaxed);
+    ENC_THETA_BITS.store(theta_m.to_bits(), Ordering::Relaxed);
     ENC_MDEG.store(
         (theta_m * 180_000.0 / core::f32::consts::PI) as i32,
         Ordering::Relaxed,
@@ -27,23 +34,28 @@ pub fn publish_angle(raw: u16, theta_m: f32, omega_m: f32, valid: bool) {
     ENC_AGE_TICKS.store(0, Ordering::Release);
 }
 
-fn theta_omega() -> (f32, f32) {
-    let theta = enc_mdeg() as f32 * (core::f32::consts::PI / 180_000.0);
-    let omega = ENC_OMEGA_MRAD.load(Ordering::Relaxed) as f32 / 1000.0;
-    (theta, omega)
-}
-
-/// Last I2C sample, no prediction (align latch).
+/// Last I2C sample. Do not extrapolate with the 12-bit ω estimate — it chatters
+/// at low speed and rotates the Park frame as if the rotor were shaking.
 pub fn theta_m_sample() -> (f32, bool) {
-    let (theta, _) = theta_omega();
-    (theta, enc_valid())
+    (
+        f32::from_bits(ENC_THETA_BITS.load(Ordering::Relaxed)),
+        enc_valid(),
+    )
 }
 
-/// ISR: `θ + ω · (N · dt)` where N is PWM periods since the last valid sample.
-pub fn theta_m_predict(dt: f32) -> (f32, bool) {
-    let ticks = ENC_AGE_TICKS.fetch_add(1, Ordering::Relaxed);
-    let (theta, omega) = theta_omega();
-    (foc::predict(theta, omega, ticks as f32 * dt), enc_valid())
+/// Age the sample counter; Park uses the last sample, not `θ + ω·age`.
+pub fn theta_m_predict(_dt: f32) -> (f32, bool) {
+    ENC_AGE_TICKS.fetch_add(1, Ordering::Relaxed);
+    theta_m_sample()
+}
+
+/// Electrical speed for Dq feed-forward from the windowed RPM, not raw ω.
+pub fn omega_e_ff(pole_pairs: u8) -> f32 {
+    let rpm = f32::from_bits(RPM_F_BITS.load(Ordering::Relaxed));
+    if !rpm.is_finite() {
+        return 0.0;
+    }
+    rpm * (core::f32::consts::TAU / 60.0) * f32::from(pole_pairs)
 }
 
 pub fn enc_raw() -> u16 {
@@ -78,6 +90,9 @@ static UD_REF_MV: AtomicI16 = AtomicI16::new(0);
 static UQ_REF_MV: AtomicI16 = AtomicI16::new(0);
 static ISR_CYCLES: AtomicU32 = AtomicU32::new(0);
 static ISR_CYCLES_MAX: AtomicU32 = AtomicU32::new(0);
+static DA_PPT: AtomicU16 = AtomicU16::new(0);
+static DB_PPT: AtomicU16 = AtomicU16::new(0);
+static DC_PPT: AtomicU16 = AtomicU16::new(0);
 
 pub fn publish_analog(s: AnalogSample) {
     publish_currents(s);
@@ -101,6 +116,23 @@ pub fn publish_bus(s: AnalogSample) {
 pub fn publish_dq(dq: crate::foc::Dq) {
     ID_MEAS_MA.store((dq.d * 1000.0) as i16, Ordering::Relaxed);
     IQ_MEAS_MA.store((dq.q * 1000.0) as i16, Ordering::Relaxed);
+}
+
+pub fn publish_duties(d: crate::foc::Duties) {
+    let ppt = |x: f32| ((x * 1000.0) as u16).min(1000);
+    DA_PPT.store(ppt(d.a), Ordering::Relaxed);
+    DB_PPT.store(ppt(d.b), Ordering::Relaxed);
+    DC_PPT.store(ppt(d.c), Ordering::Relaxed);
+}
+
+pub fn da_ppt() -> u16 {
+    DA_PPT.load(Ordering::Relaxed)
+}
+pub fn db_ppt() -> u16 {
+    DB_PPT.load(Ordering::Relaxed)
+}
+pub fn dc_ppt() -> u16 {
+    DC_PPT.load(Ordering::Relaxed)
 }
 
 pub fn publish_vdq(applied: crate::foc::Dq, reference: crate::foc::Dq) {
@@ -195,8 +227,58 @@ pub fn iw_raw() -> u16 {
     IW_RAW.load(Ordering::Relaxed)
 }
 
-/// Mechanical RPM from the last encoder ω.
+/// Mechanical RPM from net Δθ over [`crate::bsp::config::SPEED_RPM_WINDOW_S`].
 pub fn rpm_meas() -> i32 {
-    let omega = ENC_OMEGA_MRAD.load(Ordering::Relaxed) as f32 / 1000.0;
-    (omega * 60.0 / core::f32::consts::TAU) as i32
+    f32::from_bits(RPM_F_BITS.load(Ordering::Relaxed)) as i32
+}
+
+pub fn rpm_ready() -> bool {
+    RPM_READY.load(Ordering::Relaxed)
+}
+
+pub fn reset_speed_filter() {
+    RPM_RAW_INIT.store(false, Ordering::Relaxed);
+    RPM_ACC_COUNTS.store(0, Ordering::Relaxed);
+    RPM_WIN_US.store(0, Ordering::Relaxed);
+    RPM_F_BITS.store(0.0f32.to_bits(), Ordering::Relaxed);
+    RPM_READY.store(false, Ordering::Relaxed);
+}
+
+/// 12-bit wrap-aware Δraw over [`crate::bsp::config::SPEED_RPM_WINDOW_S`].
+/// Unwrapped `θ` can accumulate encoder chatter into a fake high rpm.
+pub fn push_speed_from_raw(raw: u16, dt: f32) {
+    use crate::bsp::config::SPEED_RPM_WINDOW_S;
+    let raw = raw & 0x0FFF;
+    let dt = dt.max(1e-5);
+    if !RPM_RAW_INIT.swap(true, Ordering::Relaxed) {
+        RPM_LAST_RAW.store(raw, Ordering::Relaxed);
+        RPM_ACC_COUNTS.store(0, Ordering::Relaxed);
+        RPM_WIN_US.store(0, Ordering::Relaxed);
+        return;
+    }
+    let prev = RPM_LAST_RAW.swap(raw, Ordering::Relaxed);
+    let mut d = i32::from(raw) - i32::from(prev);
+    if d > 2048 {
+        d -= 4096;
+    } else if d < -2048 {
+        d += 4096;
+    }
+    RPM_ACC_COUNTS.fetch_add(d, Ordering::Relaxed);
+    let us = (dt * 1_000_000.0) as u32;
+    let acc = RPM_WIN_US.fetch_add(us, Ordering::Relaxed) + us;
+    let win_us = (SPEED_RPM_WINDOW_S * 1_000_000.0) as u32;
+    if acc < win_us {
+        return;
+    }
+    RPM_WIN_US.store(0, Ordering::Relaxed);
+    let counts = RPM_ACC_COUNTS.swap(0, Ordering::Relaxed);
+    let t = acc as f32 / 1_000_000.0;
+    if t < 1e-3 {
+        return;
+    }
+    let rpm = counts as f32 / 4096.0 / t * 60.0;
+    if rpm.is_finite() {
+        RPM_F_BITS.store(rpm.to_bits(), Ordering::Relaxed);
+        RPM_READY.store(true, Ordering::Relaxed);
+    }
 }

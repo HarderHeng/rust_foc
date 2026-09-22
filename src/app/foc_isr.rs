@@ -1,26 +1,25 @@
 //! Current-loop body. Called from ADC JEOS only.
 
-use core::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use static_cell::StaticCell;
 
 use crate::app::{control, telemetry};
 use crate::bsp::config::{
-    CURRENT_KI, CURRENT_KP, CURRENT_LOOP_TS, DEADTIME_DUTY, MOTOR_KE_VRMS_PER_KRPM, MOTOR_LS_H,
-    NOMINAL_VBUS_V, SW_OCP_A,
+    CURRENT_KI, CURRENT_KP, CURRENT_LOOP_TS, MOTOR_FLUX_WB, MOTOR_LS_H, NOMINAL_VBUS_V, SW_OCP_A,
 };
 use crate::driver::analog::AnalogSample;
 use crate::driver::pwm::with_pwm;
 use crate::foc::current::openloop_voltage;
 use crate::foc::transforms::{clarke, park, wrap_2pi};
 use crate::foc::{
-    flux_from_ke_vrms_ll_krpm, park_theta, CurrentLoop, DeadTime, Dq, DqFf, DutyMap, DutySink,
-    FfOff, PhaseCurrents, VoltageFeedforward,
+    park_theta, CurrentLoop, Dq, DqFf, DutySink, FfOff, PhaseCurrents, VoltageFeedforward,
 };
 
 static LOOP: StaticCell<CurrentLoop> = StaticCell::new();
 static LOOP_PTR: AtomicPtr<CurrentLoop> = AtomicPtr::new(core::ptr::null_mut());
-static OL_THETA_MRAD: AtomicI32 = AtomicI32::new(0);
+/// Open-loop θe in radians (`f32` bits). Milliradian `i32` truncates a 2 Hz step to 0.
+static OL_THETA_BITS: AtomicU32 = AtomicU32::new(0);
 
 pub fn init() {
     enable_cyccnt();
@@ -37,7 +36,7 @@ pub fn reset() {
 }
 
 pub fn reset_openloop() {
-    OL_THETA_MRAD.store(0, Ordering::Relaxed);
+    OL_THETA_BITS.store(0.0f32.to_bits(), Ordering::Relaxed);
 }
 
 pub fn set_gains(kp: f32, ki: f32) {
@@ -77,8 +76,8 @@ fn vbus_v() -> f32 {
 fn openloop_step(s: AnalogSample) {
     let vbus = vbus_v();
     let dth = core::f32::consts::TAU * f32::from(control::ol_hz()) * CURRENT_LOOP_TS;
-    let th = wrap_2pi(OL_THETA_MRAD.load(Ordering::Relaxed) as f32 / 1000.0 + dth);
-    OL_THETA_MRAD.store((th * 1000.0) as i32, Ordering::Relaxed);
+    let th = wrap_2pi(f32::from_bits(OL_THETA_BITS.load(Ordering::Relaxed)) + dth);
+    OL_THETA_BITS.store(th.to_bits(), Ordering::Relaxed);
 
     let meas = park(clarke(s.abc()), th);
     telemetry::publish_dq(meas);
@@ -89,10 +88,10 @@ fn openloop_step(s: AnalogSample) {
     };
     telemetry::publish_vdq(voltage, voltage);
 
-    let duties = DeadTime {
-        shift: DEADTIME_DUTY,
-    }
-    .map(openloop_voltage(voltage.d, voltage.q, th, vbus), s.abc());
+    // Open-loop: do not use current-sign dead-time. Offset/noise flips the
+    // sign every ISR and adds ~1.5% duty chatter (felt as strong cogging).
+    let duties = openloop_voltage(voltage.d, voltage.q, th, vbus);
+    telemetry::publish_duties(duties);
     apply_duties(duties);
 }
 
@@ -123,14 +122,14 @@ fn step(s: AnalogSample) {
         },
     };
 
-    let omega_e = telemetry::enc_omega_mrad() as f32 / 1000.0 * f32::from(control::poles());
+    let omega_e = telemetry::omega_e_ff(control::poles());
     let ff = if control::mode() == control::Mode::Align {
         FfOff.vdq(refs, omega_e)
     } else {
         DqFf {
             ld: MOTOR_LS_H,
             lq: MOTOR_LS_H,
-            flux: flux_from_ke_vrms_ll_krpm(MOTOR_KE_VRMS_PER_KRPM, f32::from(control::poles())),
+            flux: MOTOR_FLUX_WB,
         }
         .vdq(refs, omega_e)
     };
@@ -144,12 +143,10 @@ fn step(s: AnalogSample) {
         return;
     };
 
-    apply_duties(
-        DeadTime {
-            shift: DEADTIME_DUTY,
-        }
-        .map(duties, s.abc()),
-    );
+    // Hardware TIM1 dead-time is already inserted. Current-sign software
+    // compensation chatters while shunt offset is still being proven.
+    telemetry::publish_duties(duties);
+    apply_duties(duties);
 }
 
 fn apply_duties(duties: crate::foc::Duties) {

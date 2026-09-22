@@ -5,6 +5,7 @@
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use embassy_stm32::flash::{Blocking, Flash};
+use embassy_stm32::interrupt::InterruptExt;
 use embassy_stm32::peripherals::FLASH;
 use embassy_stm32::Peri;
 use static_cell::StaticCell;
@@ -33,14 +34,20 @@ pub fn init(flash: Peri<'static, FLASH>) {
 }
 
 fn with_flash<R>(f: impl FnOnce(&mut Flash<'static, Blocking>) -> R) -> Option<R> {
-    cortex_m::interrupt::free(|_| {
-        let p = FLASH_PTR.load(Ordering::Acquire);
-        if p.is_null() {
-            None
-        } else {
-            Some(f(unsafe { &mut *p }))
-        }
-    })
+    // Erase takes tens of ms. Do not mask all IRQs — that deadlocks embassy
+    // flash waits and kills USART. Mask only ADC JEOS so the current ISR
+    // cannot run mid-erase (TIM1 may still be counting).
+    embassy_stm32::interrupt::ADC1_2.disable();
+    let p = FLASH_PTR.load(Ordering::Acquire);
+    let out = if p.is_null() {
+        None
+    } else {
+        Some(f(unsafe { &mut *p }))
+    };
+    unsafe {
+        embassy_stm32::interrupt::ADC1_2.enable();
+    }
+    out
 }
 
 fn checksum(body: &[u8; 12]) -> u32 {

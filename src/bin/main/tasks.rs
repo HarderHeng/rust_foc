@@ -46,6 +46,7 @@ pub async fn encoder_task(mut enc: As5600) {
         let s = enc.read(dt.max(1e-5)).await;
         telemetry::publish_angle(s.raw, s.theta_m, s.omega_m, s.valid);
         if s.valid {
+            telemetry::push_speed_from_raw(s.raw, dt.max(1e-5));
             last_ok = start;
         } else if start.duration_since(last_ok) >= Duration::from_millis(ENC_FAULT_MS as u64)
             && matches!(control::mode(), control::Mode::Run | control::Mode::Speed)
@@ -69,15 +70,20 @@ pub async fn analog_task() {
         last = now;
         control::tick(dt_ms);
 
-        if let Some(s) = analog::read_bus() {
-            telemetry::publish_bus(s);
+        if control::outputs_live() {
+            // Regular `blocking_read` fights the JEOS path (ADC disable + SMPR wipe).
             let mv = telemetry::vbus_mv();
             let t10 = telemetry::temp_c10();
-            if control::outputs_live() && mv > 0 && !(VBUS_UV_MV..=VBUS_OV_MV).contains(&mv) {
+            if mv > 0 && !(VBUS_UV_MV..=VBUS_OV_MV).contains(&mv) {
                 control::fault(control::FaultKind::Vbus);
-            } else if control::outputs_live() && t10 > (NTC_T_MAX_C * 10.0) as i16 {
+            } else if t10 > (NTC_T_MAX_C * 10.0) as i16 {
                 control::fault(control::FaultKind::Overtemp);
             } else if control::cmd_timed_out() {
+                control::fault(control::FaultKind::CmdTimeout);
+            }
+        } else if let Some(s) = analog::read_bus() {
+            telemetry::publish_bus(s);
+            if control::cmd_timed_out() {
                 control::fault(control::FaultKind::CmdTimeout);
             }
         } else if control::cmd_timed_out() {
@@ -92,7 +98,7 @@ pub async fn foc_debug_task() {
     loop {
         Timer::after_millis(100).await;
         defmt::info!(
-            "foc mode={} ia={} ib={} ic={} id={} iq={} id_ref={} iq_ref={} ud={} uq={} ud_ref={} uq_ref={} pos={} rpm={} vbus={} isr={}/{} fault={}",
+            "foc mode={} ia={} ib={} ic={} id={} iq={} id_ref={} iq_ref={} ud={} uq={} da={} db={} dc={} pos={} rpm={} vbus={} isr={}/{} fault={}",
             control::mode().as_str(),
             telemetry::iu_ma(),
             telemetry::iv_ma(),
@@ -103,8 +109,9 @@ pub async fn foc_debug_task() {
             control::iq_target_ma(),
             telemetry::ud_mv(),
             telemetry::uq_mv(),
-            telemetry::ud_ref_mv(),
-            telemetry::uq_ref_mv(),
+            telemetry::da_ppt(),
+            telemetry::db_ppt(),
+            telemetry::dc_ppt(),
             telemetry::enc_mdeg(),
             telemetry::rpm_meas(),
             telemetry::vbus_mv(),

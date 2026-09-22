@@ -8,7 +8,7 @@ use crate::app::speed as speed_loop;
 use crate::app::{foc_isr, telemetry};
 use crate::bsp::config::{
     ALIGN_ID_MA, ALIGN_MS, CMD_TIMEOUT_MS, CURRENT_KI, CURRENT_KP, IDQ_RAMP_A_S, MAX_CURRENT_MA,
-    MOTOR_MAX_RPM, RPM_RAMP_RPM_S, SPEED_KI, SPEED_KP, SPEED_RPM_MAX,
+    MOTOR_MAX_RPM, SPEED_IQ_RAMP_A_S, SPEED_KI, SPEED_KP, SPEED_RAMP_RPM_S, SPEED_RPM_MAX,
 };
 use crate::driver::analog;
 use crate::driver::nvm;
@@ -346,7 +346,8 @@ fn finish_align() {
     foc_isr::reset();
     let _ = with_pwm(|p| p.disable());
     MODE.store(Mode::Idle as u8, Ordering::Relaxed);
-    let _ = persist_nvm();
+    // Do not erase flash here: `nvm::save` used to run inside `interrupt::free`
+    // and wedged the core (UART died after every align). Use `foc save` later.
 }
 
 pub fn set_id_ma(ma: i32) {
@@ -359,11 +360,9 @@ pub fn set_iq_ma(ma: i32) {
     touch_cmd();
 }
 
-/// Speed PI writes Iq without refreshing the command watchdog or the Iq slew.
+/// Speed PI writes the Iq **target**; `poll_refs` slews the value the ISR uses.
 pub fn write_iq_ma(ma: i32) {
-    let v = ma.clamp(-MAX_CURRENT_MA, MAX_CURRENT_MA);
-    IQ_MA.store(v, Ordering::Relaxed);
-    IQ_TGT_MA.store(v, Ordering::Relaxed);
+    IQ_TGT_MA.store(ma.clamp(-MAX_CURRENT_MA, MAX_CURRENT_MA), Ordering::Relaxed);
 }
 
 /// Slew Id/Iq (Run/Align) and rpm (Speed). ISR reads the slewed values.
@@ -382,10 +381,19 @@ pub fn poll_refs(dt_ms: u32) {
         IQ_MA.store(iq, Ordering::Relaxed);
     }
     if mode() == Mode::Speed {
+        let iq = approach_i32(
+            iq_ma(),
+            IQ_TGT_MA.load(Ordering::Relaxed),
+            SPEED_IQ_RAMP_A_S * 1000.0,
+            dt,
+        );
+        IQ_MA.store(iq, Ordering::Relaxed);
+    }
+    if mode() == Mode::Speed {
         let rpm = approach_i32(
             rpm_ref(),
             RPM_TGT.load(Ordering::Relaxed),
-            RPM_RAMP_RPM_S,
+            SPEED_RAMP_RPM_S,
             dt,
         );
         RPM_REF.store(rpm, Ordering::Relaxed);

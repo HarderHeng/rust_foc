@@ -12,8 +12,12 @@ pub struct AngleTrack {
     unwrap: i32,
     last_theta: f32,
     omega_f: f32,
-    /// `ω := α·Δθ/dt + (1−α)·ω`. Default 0.2.
+    omega_acc_th: f32,
+    omega_acc_dt: f32,
+    /// Blend after each [`Self::omega_window`]: `ω := α·Δθ/Δt + (1−α)·ω`.
     pub alpha: f32,
+    /// Seconds of angle to accumulate before updating ω (AS5600 LSB is coarse).
+    pub omega_window: f32,
 }
 
 impl Default for AngleTrack {
@@ -29,7 +33,10 @@ impl AngleTrack {
             unwrap: 0,
             last_theta: 0.0,
             omega_f: 0.0,
-            alpha: 0.2,
+            omega_acc_th: 0.0,
+            omega_acc_dt: 0.0,
+            alpha: 0.35,
+            omega_window: 0.01,
         }
     }
 
@@ -56,9 +63,16 @@ impl AngleTrack {
 
         let theta = self.unwrap as f32 * (TWO_PI / COUNTS as f32);
         if had && dt > 0.0 {
-            let raw_w = (theta - self.last_theta) / dt;
-            let a = self.alpha.clamp(0.0, 1.0);
-            self.omega_f = a * raw_w + (1.0 - a) * self.omega_f;
+            self.omega_acc_th += theta - self.last_theta;
+            self.omega_acc_dt += dt;
+            let win = self.omega_window.max(1e-4);
+            if self.omega_acc_dt >= win {
+                let raw_w = self.omega_acc_th / self.omega_acc_dt;
+                let a = self.alpha.clamp(0.0, 1.0);
+                self.omega_f = a * raw_w + (1.0 - a) * self.omega_f;
+                self.omega_acc_th = 0.0;
+                self.omega_acc_dt = 0.0;
+            }
         }
         self.last_theta = theta;
         (theta, self.omega_f)
@@ -97,6 +111,21 @@ mod tests {
         let mut t = AngleTrack::new();
         let (_, w) = t.push(2048, 0.001);
         assert!(w.abs() < 1e-9);
+    }
+
+    #[test]
+    fn windowed_omega_matches_constant_rate() {
+        let mut t = AngleTrack::new();
+        t.alpha = 1.0;
+        t.omega_window = 0.01;
+        let mut raw = 0u16;
+        let mut w = 0.0;
+        for _ in 0..20 {
+            raw = (raw + 2) & 0x0FFF;
+            (_, w) = t.push(raw, 0.001);
+        }
+        let expect = 2.0 * TWO_PI / COUNTS as f32 / 0.001;
+        assert!((w - expect).abs() < 0.05, "{w} vs {expect}");
     }
 
     #[test]

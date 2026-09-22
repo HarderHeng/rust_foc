@@ -140,7 +140,12 @@ pub fn with_analog<R>(f: impl FnOnce(&mut Analog) -> R) -> Option<R> {
 
 /// VBUS/NTC: must not mask the current ISR for a 247-cycle conversion.
 pub fn read_bus() -> Option<AnalogSample> {
-    analog_mut().map(|a| a.read_bus())
+    analog_mut().map(|a| {
+        let s = a.read_bus();
+        // Embassy `blocking_read` clears ADEN and overwrites SMPR; re-arm JEOS.
+        arm_injected();
+        s
+    })
 }
 
 /// Re-run shunt offset (PWM off). Regular ADC, not the injected ISR path.
@@ -191,7 +196,8 @@ fn arm_injected() {
     });
     set_smpr(ADC2, ADC2_CH_VOPAMP3, INJ_SAMPLE);
     set_smpr(ADC2, ADC2_CH_V, INJ_SAMPLE);
-    program_pair(ShuntPair::Uv);
+    let pair = analog_mut().map(|a| a.last_pair).unwrap_or(ShuntPair::Uv);
+    program_pair(pair);
     ADC1.cr().modify(|r| r.set_jadstart(true));
     ADC2.cr().modify(|r| r.set_jadstart(true));
     ADC1.ier().modify(|r| r.set_jeosie(true));
@@ -273,6 +279,7 @@ impl Analog {
         self.off_u = (su / u32::from(OFFSET_SAMPLES)) as u16;
         self.off_v = (sv / u32::from(OFFSET_SAMPLES)) as u16;
         self.off_w = (sw / u32::from(OFFSET_SAMPLES)) as u16;
+        arm_injected();
     }
 
     pub fn read_currents(&mut self) -> AnalogSample {

@@ -19,7 +19,7 @@ const SYSTEM_SUB: &[&str] = &["info"];
 const CAL_SUB: &[&str] = &["current"];
 const FOC_SUB: &[&str] = &[
     "status", "start", "stop", "align", "id", "iq", "poles", "pwm", "offset", "zero", "save",
-    "openloop", "rpm", "kp", "ki", "skp", "ski", "isr",
+    "openloop", "rpm", "kp", "ki", "skp", "ski", "isr", "motor",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -343,7 +343,7 @@ impl Shell {
                     b"help | hello [name] | clear | version | echo [text]\r\n\
                       led on|off|toggle | system info | enc | adc | cal current\r\n\
                       foc status|start|stop|align [mA]|id <mA>|iq <mA>|poles <n>|pwm <%>\r\n\
-                      foc offset|zero|save|isr | kp|ki|skp|ski [x] | rpm <n> | openloop <vq_mV> <Hz>\r\n\
+                      foc motor | offset|zero|save|isr | kp|ki|skp|ski [x] | rpm <n> | openloop <vq_mV> <Hz>\r\n\
                       Tab: complete   Up/Down: history   Ctrl-C/U: abort/kill\r\n",
                 )
                 .await;
@@ -641,6 +641,45 @@ impl Shell {
                     let _ = self.write_all(b"isr max cleared\r\n").await;
                 }
             }
+            Some("motor") => {
+                use crate::bsp::config::{
+                    CURRENT_KI, CURRENT_KP, DEFAULT_POLE_PAIRS, MAX_CURRENT_MA, MOTOR_FLUX_WB,
+                    MOTOR_KV, MOTOR_LS_H, MOTOR_MAX_RPM, MOTOR_RS_OHM, SPEED_KI, SPEED_KP,
+                };
+                let _ = self.write_all(b"motor poles=").await;
+                let _ = self.write_i32(control::poles() as i32).await;
+                let _ = self.write_all(b" (default ").await;
+                let _ = self.write_i32(DEFAULT_POLE_PAIRS as i32).await;
+                let _ = self.write_all(b") rs=").await;
+                let _ = self.write_f32(MOTOR_RS_OHM).await;
+                let _ = self.write_all(b" ohm ls=").await;
+                let _ = self.write_f32(MOTOR_LS_H * 1000.0).await;
+                let _ = self.write_all(b" mH flux=").await;
+                let _ = self.write_f32(MOTOR_FLUX_WB).await;
+                let _ = self.write_all(b" Wb kv=").await;
+                let _ = self.write_f32(MOTOR_KV).await;
+                let _ = self.write_all(b" rpm_max=").await;
+                let _ = self.write_i32(MOTOR_MAX_RPM as i32).await;
+                let _ = self.write_all(b" imax=").await;
+                let _ = self.write_i32(MAX_CURRENT_MA).await;
+                let _ = self.write_all(b" mA kp=").await;
+                let _ = self.write_f32(control::current_kp()).await;
+                let _ = self.write_all(b"/").await;
+                let _ = self.write_f32(CURRENT_KP).await;
+                let _ = self.write_all(b" ki=").await;
+                let _ = self.write_f32(control::current_ki()).await;
+                let _ = self.write_all(b"/").await;
+                let _ = self.write_f32(CURRENT_KI).await;
+                let _ = self.write_all(b" skp=").await;
+                let _ = self.write_f32(control::speed_kp()).await;
+                let _ = self.write_all(b"/").await;
+                let _ = self.write_f32(SPEED_KP).await;
+                let _ = self.write_all(b" ski=").await;
+                let _ = self.write_f32(control::speed_ki()).await;
+                let _ = self.write_all(b"/").await;
+                let _ = self.write_f32(SPEED_KI).await;
+                let _ = self.write_all(b"\r\n").await;
+            }
             Some("pwm") => match parse_u8(toks.next()) {
                 Some(pct) => {
                     control::set_pwm_pct(pct);
@@ -649,11 +688,31 @@ impl Shell {
                     let _ = self.write_all(b"%\r\n").await;
                 }
                 None => {
-                    let _ = self.write_all(b"usage: foc pwm <0-100>\r\n").await;
+                    let ccr = crate::driver::pwm::with_pwm(|p| p.read_ccr()).unwrap_or([0; 4]);
+                    let max = crate::driver::pwm::with_pwm(|p| p.max_duty()).unwrap_or(1);
+                    let _ = self.write_all(b"ccr=").await;
+                    let _ = self.write_i32(ccr[0] as i32).await;
+                    let _ = self.write_all(b"/").await;
+                    let _ = self.write_i32(ccr[1] as i32).await;
+                    let _ = self.write_all(b"/").await;
+                    let _ = self.write_i32(ccr[2] as i32).await;
+                    let _ = self.write_all(b"/").await;
+                    let _ = self.write_i32(ccr[3] as i32).await;
+                    let _ = self.write_all(b" arr=").await;
+                    let _ = self.write_i32(max as i32).await;
+                    let _ = self.write_all(b" da=").await;
+                    let _ = self.write_i32(app::da_ppt() as i32).await;
+                    let _ = self.write_all(b" db=").await;
+                    let _ = self.write_i32(app::db_ppt() as i32).await;
+                    let _ = self.write_all(b" dc=").await;
+                    let _ = self.write_i32(app::dc_ppt() as i32).await;
+                    let _ = self.write_all(b" moe=").await;
+                    let moe = crate::driver::pwm::with_pwm(|p| p.is_enabled()).unwrap_or(false);
+                    let _ = self.write_all(if moe { b"1\r\n" } else { b"0\r\n" }).await;
                 }
             },
             _ => {
-                let _ = self.write_all(b"usage: foc status|start|stop|align [mA]|id|iq|poles|pwm|offset|zero|save|isr [reset]|openloop|rpm|kp|ki|skp|ski\r\n").await;
+                let _ = self.write_all(b"usage: foc status|start|stop|align [mA]|id|iq|poles|motor|pwm|offset|zero|save|isr [reset]|openloop|rpm|kp|ki|skp|ski\r\n").await;
             }
         }
     }

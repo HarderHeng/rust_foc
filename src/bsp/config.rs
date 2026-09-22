@@ -1,5 +1,5 @@
-//! Electrical and motor constants from 122 (`power_stage_parameters.h`,
-//! `drive_parameters.h`, `pmsm_motor_parameters.h`).
+//! Board / power-stage constants (122 `power_stage_parameters.h` and PWM).
+//! Motor nameplate and loop first-tune live in [`super::motor`] — swap that file.
 
 pub const UART_BAUDRATE: u32 = 921600;
 pub const HSE_FREQ_HZ: u32 = 8_000_000;
@@ -62,30 +62,9 @@ pub const NTC_T0_C: f32 = 25.0;
 pub const NTC_DV_DT: f32 = 0.019;
 pub const NTC_T_MAX_C: f32 = 70.0;
 
-/// `POLE_PAIR_NUM`
-pub const DEFAULT_POLE_PAIRS: u8 = 4;
-
-/// `RS` / `LS` (documentation / later observers)
-pub const MOTOR_RS_OHM: f32 = 0.32;
-pub const MOTOR_LS_H: f32 = 0.00047;
-pub const MOTOR_KE_VRMS_PER_KRPM: f32 = 3.0;
-pub const MOTOR_MAX_RPM: u16 = 6420;
-
-/// `IQMAX_A` / `NOMINAL_CURRENT_A`
-pub const NOMINAL_CURRENT_A: f32 = 5.0;
+pub use super::motor::*;
 
 pub const CURRENT_LOOP_TS: f32 = 1.0 / PWM_FREQ_HZ as f32;
-
-/// ~1/10 of the 20 kHz sample rate. `kp = Ls·ω`, `ki = Rs·ω`.
-pub const CURRENT_BW_RAD: f32 = 2_000.0;
-pub const CURRENT_KP: f32 = MOTOR_LS_H * CURRENT_BW_RAD;
-pub const CURRENT_KI: f32 = MOTOR_RS_OHM * CURRENT_BW_RAD;
-
-pub const SW_OCP_A: f32 = NOMINAL_CURRENT_A * 1.5;
-
-/// Forced-D align (`foc align`): hold `id`, `iq=0`, θe=0, then latch encoder as offset.
-pub const ALIGN_MS: u32 = 500;
-pub const ALIGN_ID_MA: i32 = 500;
 
 /// 122 `OV_VOLTAGE_THRESHOLD_V` / `UD_VOLTAGE_THRESHOLD_V`
 pub const VBUS_OV_MV: u16 = 28_000;
@@ -94,18 +73,8 @@ pub const VBUS_UV_MV: u16 = 8_000;
 pub const OPENLOOP_VQ_MAX_MV: i32 = 3_000;
 pub const OPENLOOP_HZ_MAX: u8 = 80;
 
-/// Speed PI: A / RPM and A / (RPM·s). Conservative first tune.
-pub const SPEED_LOOP_HZ: u32 = 1_000;
-pub const SPEED_KP: f32 = 0.002;
-pub const SPEED_KI: f32 = 0.01;
-pub const SPEED_RPM_MAX: i32 = 8_000;
-
-pub const MAX_CURRENT_MA: i32 = 5_000;
-
-/// Medium-frequency reference ramps (122 STC-style, ~1 kHz).
+/// Medium-frequency Id/Iq reference ramp (A/s), independent of the motor file.
 pub const IDQ_RAMP_A_S: f32 = 10.0;
-/// 0 → `MOTOR_MAX_RPM` in 1 s (`OPEN_LOOP_SPEED_RAMP_DURATION_MS`).
-pub const RPM_RAMP_RPM_S: f32 = MOTOR_MAX_RPM as f32;
 
 /// Run/Speed: trip if no `iq`/`rpm`/`start` command for this long.
 pub const CMD_TIMEOUT_MS: u32 = 2_000;
