@@ -17,10 +17,9 @@ use embassy_stm32::peripherals::{
 use embassy_stm32::Peri;
 use static_cell::StaticCell;
 
-use crate::bsp::config::{
-    adc_to_amps, adc_to_temp_c, adc_to_vbus, BUS_FAULT_MS, SAMPLE_CENTER_MARGIN,
-};
-use crate::foc::{Duties, DutySink, PhaseAbc, PhaseCurrents};
+use crate::bsp::config::{adc_to_amps, adc_to_temp_c, adc_to_vbus, BUS_FAULT_MS};
+use crate::foc::sampling::ShuntPair;
+use crate::foc::{PhaseAbc, PhaseCurrents};
 
 const VBUS_SAMPLE: SampleTime = SampleTime::CYCLES247_5;
 const NTC_SAMPLE: SampleTime = SampleTime::CYCLES47_5;
@@ -79,6 +78,7 @@ pub struct Analog {
     off_v: u16,
     off_w: u16,
     last_pair: ShuntPair,
+    discard_samples: u8,
     bus_phase: BusPhase,
     bus_started_ms: u32,
 }
@@ -88,17 +88,6 @@ enum BusPhase {
     Idle,
     Vbus,
     Ntc { vbus_raw: u16 },
-}
-
-/// Simultaneous pair for the next TIM1 CH4 edge (122 sector tables).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ShuntPair {
-    /// ADC1 U + ADC2 V (ST sector 4/5, mid-PWM default)
-    Uv,
-    /// ADC1 U + ADC2 VOPAMP3 (sector 2/3)
-    Uw,
-    /// ADC1 W + ADC2 V (sector 6/1)
-    Vw,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -140,6 +129,7 @@ pub fn init(
         off_v: 0,
         off_w: 0,
         last_pair: ShuntPair::Uv,
+        discard_samples: 0,
         bus_phase: BusPhase::Idle,
         bus_started_ms: 0,
     };
@@ -294,20 +284,6 @@ fn program_pair(pair: ShuntPair) {
     }
 }
 
-fn pair_from_duties(d: Duties) -> ShuntPair {
-    // 122: keep sector 5 (UV) while ARR − maxCCR > Tafter.
-    if 1.0 - d.a.max(d.b).max(d.c) > SAMPLE_CENTER_MARGIN {
-        return ShuntPair::Uv;
-    }
-    if d.a >= d.b && d.a >= d.c {
-        ShuntPair::Vw
-    } else if d.b >= d.a && d.b >= d.c {
-        ShuntPair::Uw
-    } else {
-        ShuntPair::Uv
-    }
-}
-
 impl Analog {
     fn decode_jdr(&self) -> (u16, u16, u16) {
         let j1 = ADC1.jdr(0).read().jdata();
@@ -319,10 +295,18 @@ impl Analog {
         }
     }
 
-    /// After SVPWM: program JSQR for the next CH4 edge.
+    /// Apply the pair chosen together with the PWM trigger by the sampling planner.
     /// `last_pair` is the pair the *next* JEOS must decode (conversion not yet taken).
-    pub fn schedule_pair(&mut self, d: Duties) {
-        self.apply(d);
+    pub fn schedule_pair(&mut self, pair: ShuntPair) {
+        self.last_pair = pair;
+        program_pair(pair);
+    }
+
+    /// At start only: discard at most one pending and one in-flight old result.
+    /// Injected queues are disabled and both ADCs have one rank. Runtime timing
+    /// errors must trip; skipping samples is not a live deadline workaround.
+    pub fn discard_startup_samples(&mut self) {
+        self.discard_samples = 2;
     }
     fn calibrate_offsets(&mut self) {
         route_opamp3(ShuntPair::Uv);
@@ -338,9 +322,14 @@ impl Analog {
         self.off_v = (sv / u32::from(OFFSET_SAMPLES)) as u16;
         self.off_w = (sw / u32::from(OFFSET_SAMPLES)) as u16;
         self.last_pair = ShuntPair::Uv;
+        self.discard_samples = 0;
     }
 
-    pub fn read_currents(&mut self) -> AnalogSample {
+    pub fn read_currents(&mut self) -> Option<AnalogSample> {
+        if self.discard_samples != 0 {
+            self.discard_samples -= 1;
+            return None;
+        }
         let (iu_raw, iv_raw, iw_raw) = self.decode_jdr();
         let mut iu_a = adc_to_amps(iu_raw, self.off_u);
         let mut iv_a = adc_to_amps(iv_raw, self.off_v);
@@ -350,7 +339,7 @@ impl Analog {
             ShuntPair::Uw => iv_a = -iu_a - iw_a,
             ShuntPair::Vw => iu_a = -iv_a - iw_a,
         }
-        AnalogSample {
+        Some(AnalogSample {
             iu_raw,
             iv_raw,
             iw_raw,
@@ -358,7 +347,7 @@ impl Analog {
             iv_a,
             iw_a,
             ..AnalogSample::default()
-        }
+        })
     }
 
     /// Only at boot / calibration, with both conversion groups stopped.
@@ -427,12 +416,5 @@ impl Analog {
             }
             _ => None,
         }
-    }
-}
-
-impl DutySink for Analog {
-    fn apply(&mut self, d: Duties) {
-        self.last_pair = pair_from_duties(d);
-        program_pair(self.last_pair);
     }
 }

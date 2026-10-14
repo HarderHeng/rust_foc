@@ -4,3 +4,4 @@ pub mod led;
 pub mod nvm;
 pub mod ocp;
 pub mod pwm;
+pub mod watchdog;

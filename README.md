@@ -12,6 +12,9 @@ Embassy Rust FOC for **STM32G431CB** boards electrically compatible with ST B-G4
 
 ## Build
 
+CI pins Rust 1.98.1 and flip-link 0.1.12. Local builds need the
+`thumbv7em-none-eabihf` target, rustfmt, Clippy, and `flip-link` on PATH.
+
 ```bash
 scripts/check.py --offline        # fmt, host tests, check, clippy; 120 s deadline per command
 scripts/check.py --offline --build  # also links release firmware (requires flip-link)
@@ -38,11 +41,13 @@ foc iq 200         # mA, slewed at 10 A/s
 
 Run/Speed require `cal=ok`: a qualified alignment, a valid version-2 NVM record, or an explicitly entered verified offset (`foc offset <mrad>`). Firmware with NVM version 2 intentionally ignores older records; re-align and save once after upgrading. Changing pole pairs invalidates calibration.
 
-Alignment completes only after continuous fresh current-loop feedback with measured Id near target, Iq near zero, a valid encoder, and rotor motion within the configured limit. Otherwise it trips `fault=align` after 2 s and keeps the previous offset. Live outputs trip `fault=stall` if the supervisor sees no current-control completion for 5 ms. Panic and HardFault disable TIM1 outputs before halting. These are software protections; a hardware watchdog is still required.
+Alignment completes only after continuous fresh current-loop feedback with measured Id near target, Iq near zero, a valid encoder, and rotor motion within the configured limit. Otherwise it trips `fault=align` after 2 s and keeps the previous offset. Live outputs trip `fault=stall` if the supervisor sees no current-control completion for 5 ms. Panic and HardFault disable TIM1 outputs before halting. An independent LSI-clocked watchdog starts after bring-up, with a nominal 1 s reset deadline. Only the supervisor feeds it, at least 50 ms apart and after both ADC and encoder-task progress. Actual timeout and reset output levels require board acceptance.
 
 VBUS/NTC are sampled while running. Missing bus data trips `fault=adc`; encoder errors trip immediately, and stale samples time out after 20 ms. Pole pairs and offset can only be edited in Idle. Encoder position is single-turn; accumulated turns no longer reduce Park-angle precision.
 
 Id/Iq/RPM ramps retain sub-unit steps instead of rounding every tick. `foc isr` reports the JEOS handler-body last/max cycles, call count and budget overruns; `foc isr reset` clears the measurement window. It includes ADC reads but excludes exception entry/exit and scheduling latency. Park and inverse Park share one sin/cos pair per control step.
+
+PWM phase compares, CH4 trigger and ADC pair now come from one integer sampling plan. When two high duties leave no settled window, the planner subtracts an equal common-mode shift from all phases, preserving quantized line voltages. An impossible plan or a live commit that misses the down-count window disables outputs with `fault=adc`. Startup discards two potentially old injected results. `foc pwm` may therefore apply a lower common duty than requested near 100%; check the CCR readback. Sampling geometry is host-tested; switching noise and real ADC latency still need scope verification.
 
 See [safety changes and board acceptance checklist](docs/safety-bringup.md) before loaded operation. Host tests cover algorithms and the firmware control state machine with mocked hardware; ADC/PWM timing still requires on-board verification.
 

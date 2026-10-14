@@ -26,16 +26,13 @@ pub const fn tw_after_ticks() -> u32 {
     ((SYSCLK_FREQ_HZ as u64) * (PWM_DEADTIME_NS + TNOISE_NS) as u64 / 1_000_000_000) as u32
 }
 
-/// 122 `TW_BEFORE`: a few ADC sample + trigger ticks.
+/// Complete injected conversion budget, expressed in TIM1 ticks.
+/// Embassy selects SYSCLK / 4 = 42.5 MHz for the G4 ADC (60 MHz maximum).
+/// 2.5 sampling + 12.5 conversion + 4 trigger/synchronization cycles = 19
+/// ADC cycles, or 76 TIM1 ticks. Keep the full conversion clear of commutation.
 pub const fn tw_before_ticks() -> u32 {
-    16
+    19 * 4
 }
-
-/// Stay on UV / CCR4≈ARR while `(1 − max_duty) > this` (122 `ARR − maxCCR > Tafter`).
-pub const SAMPLE_CENTER_MARGIN: f32 = {
-    let arr = SYSCLK_FREQ_HZ / (2 * PWM_FREQ_HZ);
-    tw_after_ticks() as f32 / arr as f32
-};
 
 /// `RSHUNT`
 pub const SHUNT_OHM: f32 = 0.003;
@@ -94,6 +91,12 @@ pub const BUS_FAULT_MS: u32 = 20;
 /// Supervisor must observe current-control completion within this interval.
 /// A task-level watchdog, NOT a substitute for an independent hardware watchdog.
 pub const CURRENT_STALL_MS: u32 = 5;
+
+/// Independent LSI-clocked reset fallback. Actual duration depends on LSI tolerance;
+/// Idle offset calibration / flash save must fit this budget; verify on the board.
+pub const IWDG_TIMEOUT_MS: u32 = 1_000;
+/// Feed only after supervisor, current IRQ and encoder task have all progressed.
+pub const IWDG_FEED_INTERVAL_MS: u32 = 50;
 
 pub fn adc_to_amps(counts: u16, offset: u16) -> f32 {
     let volts = (counts as f32 - offset as f32) * (ADC_VREF / ADC_FULL_SCALE);

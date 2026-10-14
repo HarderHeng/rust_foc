@@ -40,7 +40,16 @@
   and keeps the previous offset. The thresholds require unloaded board review.
 - The supervisor trips `fault=stall` if live outputs observe no current-control
   completion for 5 ms. The completion sequence is separate from `foc isr` diagnostics,
-  so a statistics reset cannot pet it. This does not detect a stalled executor or CPU.
+  so a statistics reset cannot pet it.
+- Independent IWDG starts after peripheral bring-up and boot offset calibration.
+  Its LSI-clocked reset timeout is nominally 1 s; actual LSI tolerance must be measured.
+  Only the analog supervisor feeds it, after protection/control work, at least 50 ms
+  apart and only when both ADC completions and encoder-task iterations have advanced.
+  Neither interrupt progress alone nor an Idle maintenance operation bypasses this
+  policy. Encoder error paths count as task liveness while the sensor interlocks still
+  disable closed-loop outputs. Runtime offset calibration (48 blocking ADC reads)
+  and a flash save (one page erase and two doubleword writes) must fit the timeout
+  allowance; their worst-case duration has not yet been established on the board.
 - Panic and HardFault disable TIM1 MOE and CH1-3/CH1N-3, without logging or shared
   borrows, then halt with interrupts disabled. PWM access uses a checked
   `Mutex<RefCell<Option<_>>>` rather than an escaping mutable reference.
@@ -60,9 +69,24 @@
   the fractional part of each polling interval. Zero elapsed time does not advance it.
 - Park and inverse Park share one sin/cos pair per current or open-loop step.
   ADC timing, regulator gains and release optimization level are unchanged.
-- Known open item: the high-duty current sample trigger may still choose a phase whose
-  low-side window is not open (for example duties near 0.933/0.933/0.067). Do not run
-  near modulation saturation until the trigger/pair planner is corrected and scoped.
+- PWM phase CCRs, CH4 trigger and ADC pair share one integer sampling planner.
+  Each measured phase must settle for `Tafter` after its up-count switching edge and
+  remain conducting throughout the complete ADC budget. The current budget is
+  76 TIM1 ticks: 2.5 sampling + 12.5 conversion + 4 synchronization/margin cycles at
+  the HAL-selected SYSCLK/4 ADC clock. Prefer UV at ARR-1; otherwise select the lowest
+  two compares. If needed, subtract the smallest equal common-mode shift from all
+  three CCRs, preserving every quantized line voltage. An impossible window trips
+  `fault=adc`. Host tests include 0.933/0.933/0.067 and all its permutations, timer
+  boundary exhaustion, full duty, complete ADC budgets and an SVPWM revolution sweep.
+  This fixes the known geometric window failure; ADC latency, regular/injected ADC
+  arbitration and noise from the unmeasured phase remain scope acceptance items.
+- Live commits mask timer update transfers with UDIS while writing all four CCRs
+  and ADC routing. They must start and finish on the down-count before the valley,
+  with no new pending JEOS; a missed window disables MOE and trips `fault=adc`.
+  Startup uses explicit UG with MOE off and discards two injected results to cover
+  a pending old JDR and an in-flight old single-rank conversion. These skips are not
+  used to conceal runtime deadline failures. Near 100%, Bench common duty can be
+  shifted down as well; use CCR readback to see the applied duty.
 
 ## IRQ timing diagnostics
 
@@ -85,6 +109,11 @@ included. Thus zero overruns is **not** proof of meeting the hardware deadline; 
 margin and use on-board timing measurements for acceptance. The diagnostic does not
 trip the motor automatically. Do not compare these maxima directly with the previous
 control-body-only measurement.
+
+The live register commit has a stricter phase deadline: after a near-center CH4
+sample, all preloads and ADC routing must be committed before the following valley
+(approximately half a PWM period, less conversion time). The runtime guard trips
+`fault=adc` on a missed commit even when the 50 us diagnostic overrun count is zero.
 
 After safe unloaded startup, clear the window with `foc isr reset`, exercise UART/RTT
 traffic and regular sampling, then collect `foc isr` plus oscilloscope timing. No speedup
@@ -109,6 +138,11 @@ alignment failure/restart/success, pole-change invalidation, and the current-con
 stall trip in every live mode. Pure tests cover slow
 and negative ramps, reversal, jittered intervals, integer limits, DWT wrap, diagnostic
 counter saturation, and rotation equations.
+Sampling tests independently exhaust small timer geometries and sweep the SVPWM
+circle; watchdog tests exercise worker stalls and maintenance recovery. The UART
+completion/formatting helpers are also compiled and tested from their production
+module. The current baseline is 83 passing tests. CI pins Rust 1.98.1 and flip-link
+0.1.12 and runs the full script including release linking.
 These tests do **not** validate ADC/TIM1 electrical timing or real IRQ latency.
 
 ## Board acceptance required before loaded operation
@@ -140,8 +174,19 @@ core with SWD while PWM is enabled. Do not treat a successful host test as board
    verify panic and HardFault disable all six outputs within an acceptable time.
 9. **Alignment:** verify success, tolerance, rotor-motion detection and timeout with a
    current-limited unloaded motor; check that a failed alignment keeps the old offset.
+10. **Sampling planner:** with controlled PWM test patterns, scope both measured
+    low-side windows and the ADC trigger/conversion. Include two equal high duties,
+    all phase permutations, the complete modulation sweep and regular ADC activity.
+    Check that common-mode adjustment preserves line voltages and that delayed
+    commits trip `fault=adc`. Verify startup ignores the two old results and remains
+    at safe prepared duty until new feedback is accepted.
+11. **IWDG:** in dedicated test builds with outputs initially off, stall the executor
+    while ADC interrupts continue, stop the ADC IRQ while tasks continue, and halt
+    all CPU work. Measure reset delay and all six gate outputs through reset/reboot.
+    Verify reboot stays in Idle. Repeatedly run Idle calibration and flash save at
+    supply/temperature limits; confirm their duration plus feed interval fits the
+    shortest measured watchdog timeout, including LSI variation.
 
-Remaining work includes the high-duty sampling planner, an independent hardware
-watchdog, board-level end-to-end IRQ timing measurements, and minimizing critical
-sections after measurement.
+Remaining work includes board-level validation of the sampling planner and IWDG,
+end-to-end IRQ timing measurements, and minimizing critical sections after measurement.
 NVM writes still require PWM off and can stall flash execution.

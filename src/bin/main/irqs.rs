@@ -23,7 +23,7 @@ impl Handler<interrupt::typelevel::ADC1_2> for AdcJeos {
             // W1C: preserve regular EOS/EOC for the nonblocking bus sampler.
             ADC1.isr().write(|r| r.set_jeos(true));
             ADC2.isr().write(|r| r.set_jeos(true));
-            if let Some(s) = analog::with_analog(|a| a.read_currents()) {
+            if let Some(s) = analog::with_analog(|a| a.read_currents()).flatten() {
                 foc_isr::on_injected(s);
                 telemetry::publish_control_completion();
             }

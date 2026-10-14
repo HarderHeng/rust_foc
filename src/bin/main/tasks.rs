@@ -10,6 +10,7 @@ use stm32g431_foc::bsp::config::AS5600_PERIOD_US;
 use stm32g431_foc::driver::analog;
 use stm32g431_foc::driver::as5600::As5600;
 use stm32g431_foc::driver::led::LedHandle;
+use stm32g431_foc::driver::watchdog;
 
 #[embassy_executor::task]
 pub async fn shell_task(
@@ -55,6 +56,7 @@ pub async fn encoder_task(mut enc: As5600) {
             control::fault(control::FaultKind::Encoder);
         }
         let _ = speed::tick(s.omega_m, s.valid, dt.max(1e-5));
+        watchdog::encoder_completed();
         let used = Instant::now().duration_since(start);
         if used < period {
             Timer::after(period - used).await;
@@ -84,6 +86,7 @@ pub async fn analog_task() {
         }
         control::supervise_current(now_ms as u32);
         control::tick(dt_ms);
+        watchdog::supervise();
         Timer::after_millis(1).await;
     }
 }

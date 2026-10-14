@@ -15,6 +15,7 @@ use stm32g431_foc::driver::as5600::{i2c_config, As5600};
 use stm32g431_foc::driver::led::{Led, LedHandle};
 use stm32g431_foc::driver::ocp;
 use stm32g431_foc::driver::pwm::{init_pwm, with_pwm, MotorPwm};
+use stm32g431_foc::driver::watchdog;
 
 use crate::irqs::Irqs;
 
@@ -71,6 +72,9 @@ pub fn start(p: Peripherals) -> Board {
     .expect("UART init failed");
     let (uart_tx, rx) = uart.split();
     let uart_rx = rx.into_ring_buffered(UART_RX_DMA.init([0u8; 128]));
+
+    // Independent fallback starts after blocking boot calibration is complete.
+    watchdog::init(p.IWDG);
 
     Board {
         led,

@@ -130,6 +130,7 @@ pub mod app {
 
 pub mod driver {
     pub mod pwm {
+        use crate::foc::sampling::{plan_sampling, SamplePlan};
         use crate::foc::Duties;
         use std::sync::Mutex;
         #[derive(Default)]
@@ -137,24 +138,46 @@ pub mod driver {
             pub enabled: bool,
             pub break_pending: bool,
             pub trip_on_enable: bool,
+            pub reject_plan: bool,
             pub prepared: Option<Duties>,
         }
         pub static PWM: Mutex<MotorPwm> = Mutex::new(MotorPwm {
             enabled: false,
             break_pending: false,
             trip_on_enable: false,
+            reject_plan: false,
             prepared: None,
         });
         impl MotorPwm {
             pub fn disable(&mut self) {
                 self.enabled = false;
             }
-            pub fn prepare_start(&mut self, duties: Duties) -> bool {
+            pub fn plan(&self, d: Duties) -> Option<SamplePlan> {
+                if self.reject_plan {
+                    return None;
+                }
+                plan_sampling(
+                    [d.a, d.b, d.c].map(|x| (x * 4250.0) as u32),
+                    4250,
+                    crate::bsp::config::tw_after_ticks(),
+                    crate::bsp::config::tw_before_ticks(),
+                )
+            }
+            pub fn prepare_start(
+                &mut self,
+                plan: &SamplePlan,
+                analog: &mut super::analog::Analog,
+            ) -> bool {
                 self.disable();
                 if self.break_pending {
                     return false;
                 }
-                self.prepared = Some(duties);
+                analog.schedule_pair(plan.pair);
+                self.prepared = Some(Duties {
+                    a: plan.ccr[0] as f32 / 4250.0,
+                    b: plan.ccr[1] as f32 / 4250.0,
+                    c: plan.ccr[2] as f32 / 4250.0,
+                });
                 self.enabled = true;
                 if self.trip_on_enable {
                     self.trip_on_enable = false;
@@ -168,12 +191,14 @@ pub mod driver {
         }
     }
     pub mod analog {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        pub static AVAILABLE: AtomicBool = AtomicBool::new(true);
         pub struct Analog;
-        impl crate::foc::DutySink for Analog {
-            fn apply(&mut self, _: crate::foc::Duties) {}
+        impl Analog {
+            pub fn schedule_pair(&mut self, _: crate::foc::sampling::ShuntPair) {}
         }
         pub fn with_analog<R>(f: impl FnOnce(&mut Analog) -> R) -> Option<R> {
-            Some(f(&mut Analog))
+            AVAILABLE.load(SeqCst).then(|| f(&mut Analog))
         }
         pub fn recalibrate() -> bool {
             true
@@ -368,6 +393,22 @@ fn control_safety_regressions() {
     assert!(c::mode() == Mode::Fault);
     assert!(!PWM.lock().unwrap().enabled);
     PWM.lock().unwrap().break_pending = false;
+    c::stop();
+
+    // Reject sampling failures before enabling PWM, with an ADC fault rather
+    // than misreporting a brake trip or silently running on an invalid pair.
+    PWM.lock().unwrap().reject_plan = true;
+    assert!(!c::start());
+    assert!(c::mode() == Mode::Fault);
+    assert!(c::last_fault() == FaultKind::Adc);
+    assert!(!PWM.lock().unwrap().enabled);
+    PWM.lock().unwrap().reject_plan = false;
+    c::stop();
+    driver::analog::AVAILABLE.store(false, SeqCst);
+    assert!(!c::start());
+    assert!(c::last_fault() == FaultKind::Adc);
+    assert!(!PWM.lock().unwrap().enabled);
+    driver::analog::AVAILABLE.store(true, SeqCst);
     c::stop();
 
     // All live modes, including Bench and Openloop, require ADC progress.

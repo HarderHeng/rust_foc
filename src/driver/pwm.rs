@@ -4,7 +4,7 @@ use core::cell::RefCell;
 use cortex_m::interrupt::Mutex;
 
 use embassy_stm32::gpio::{OutputType, Pull, Speed};
-use embassy_stm32::pac::timer::vals::Ocm;
+use embassy_stm32::pac::timer::vals::{Dir, Ocm};
 use embassy_stm32::pac::TIM1 as TIM1_PAC;
 use embassy_stm32::peripherals::{PA10, PA12, PA8, PA9, PB15, PC13, TIM1};
 use embassy_stm32::time::Hertz;
@@ -18,7 +18,9 @@ use embassy_stm32::timer::Channel;
 use embassy_stm32::Peri;
 
 use crate::bsp::config::{pwm_deadtime_ticks, tw_after_ticks, tw_before_ticks, PWM_FREQ_HZ};
-use crate::foc::{Duties, DutySink};
+use crate::driver::analog::Analog;
+use crate::foc::sampling::{plan_sampling, SamplePlan};
+use crate::foc::Duties;
 
 static PWM: Mutex<RefCell<Option<MotorPwm>>> = Mutex::new(RefCell::new(None));
 
@@ -174,12 +176,15 @@ impl MotorPwm {
 
     /// Arm only after safe CCR values have been transferred to the active registers.
     /// A pending hardware break must be serviced, never cleared by a start request.
-    pub fn prepare_start(&mut self, duties: Duties) -> bool {
+    pub fn prepare_start(&mut self, plan: &SamplePlan, analog: &mut Analog) -> bool {
         self.disable();
         if TIM1_PAC.sr().read().bif(0) {
             return false;
         }
-        self.set_duties(duties);
+        // A pending JDR plus one in-flight old conversion may precede the first
+        // new trigger. Neither is valid feedback for this start configuration.
+        analog.discard_startup_samples();
+        self.write_plan(plan, analog);
         TIM1_PAC.egr().write(|r| r.set_ug(true));
         self.inner.set_master_output_enable(true);
         if TIM1_PAC.sr().read().bif(0) {
@@ -197,42 +202,81 @@ impl MotorPwm {
         self.inner.get_master_output_enable()
     }
 
-    pub fn set_duties(&mut self, d: Duties) {
-        self.apply(d);
-    }
-
-    /// PWM2 CCR4: mid-PWM (`ARR−1`) or into the high-duty low-side window (122 `Tafter`/`Tbefore`).
-    fn set_ch4_sample(&mut self, d: Duties) {
-        let arr = self.max_duty;
-        let max_ccr = ((d.a.max(d.b).max(d.c) * arr as f32) as u32).min(arr);
-        let ccr4 = if arr.saturating_sub(max_ccr) > tw_after_ticks() {
-            arr.saturating_sub(1)
-        } else {
-            max_ccr
-                .saturating_sub(tw_before_ticks())
-                .clamp(1, arr.saturating_sub(1))
-        };
-        self.inner.set_duty(Channel::Ch4, ccr4);
-    }
-
-    /// Same duty on all phases (PWM bring-up, motor disconnected).
-    pub fn set_duty_all(&mut self, duty_01: f32) {
-        self.set_duties(Duties {
-            a: duty_01,
-            b: duty_01,
-            c: duty_01,
-        });
-    }
-}
-
-impl DutySink for MotorPwm {
-    fn apply(&mut self, d: Duties) {
+    /// Use the actual timer ARR and the same integer quantization as CCR writes.
+    /// Invalid voltages must never turn into an arbitrary duty through float casts.
+    pub fn plan(&self, d: Duties) -> Option<SamplePlan> {
+        if !d.a.is_finite() || !d.b.is_finite() || !d.c.is_finite() {
+            return None;
+        }
         let d = d.clamp01();
+        let arr = u32::from(TIM1_PAC.arr().read().arr());
+        let ccr = |x: f32| (x * self.max_duty as f32) as u32;
+        plan_sampling(
+            [ccr(d.a), ccr(d.b), ccr(d.c)],
+            arr,
+            tw_after_ticks(),
+            tw_before_ticks(),
+        )
+    }
+
+    /// Commit all preloads and ADC routing from one plan. UDIS prevents a timer
+    /// update from transferring only a prefix of CCR1..4 while these are written.
+    /// This transaction must finish before the next CH4 edge (board timing check).
+    pub fn apply_plan(&mut self, plan: &SamplePlan, analog: &mut Analog) -> Option<Duties> {
+        let updates_disabled = TIM1_PAC.cr1().read().udis();
+        TIM1_PAC.cr1().modify(|w| w.set_udis(true));
+        let before = TIM1_PAC.cnt().read().cnt();
+        let arr = TIM1_PAC.arr().read().arr();
+        // Center sampling completes on the down-count. Plans must reach all
+        // preloads before the valley, where the next period becomes active.
+        // A new JEOS here means this handler has already missed another sample.
+        // After a whole-cycle delay, DIR can already be DOWN again while the
+        // next conversion has not yet raised JEOS. Exclude that peak-side gap.
+        if TIM1_PAC.cr1().read().dir() != Dir::DOWN
+            || u32::from(before) > u32::from(arr).saturating_sub(tw_before_ticks())
+            || embassy_stm32::pac::ADC1.isr().read().jeos()
+        {
+            self.disable();
+            TIM1_PAC.cr1().modify(|w| w.set_udis(updates_disabled));
+            return None;
+        }
+        self.write_plan_registers(plan, analog);
+        // Restore updates before the final check: crossing the valley while
+        // UDIS was set must be detected even if it happens during restoration.
+        TIM1_PAC.cr1().modify(|w| w.set_udis(updates_disabled));
+        let after = TIM1_PAC.cnt().read().cnt();
+        let timely = TIM1_PAC.cr1().read().dir() == Dir::DOWN
+            && after <= before
+            && !embassy_stm32::pac::ADC1.isr().read().jeos();
+        if !timely {
+            self.disable();
+        }
+        timely.then(|| self.applied_duties(plan))
+    }
+
+    /// Startup has MOE off and explicitly transfers preloads with UG, so it
+    /// does not need the live down-count deadline guard.
+    fn write_plan(&mut self, plan: &SamplePlan, analog: &mut Analog) {
+        let updates_disabled = TIM1_PAC.cr1().read().udis();
+        TIM1_PAC.cr1().modify(|w| w.set_udis(true));
+        self.write_plan_registers(plan, analog);
+        TIM1_PAC.cr1().modify(|w| w.set_udis(updates_disabled));
+    }
+
+    fn write_plan_registers(&mut self, plan: &SamplePlan, analog: &mut Analog) {
+        self.inner.set_duty(Channel::Ch1, plan.ccr[0]);
+        self.inner.set_duty(Channel::Ch2, plan.ccr[1]);
+        self.inner.set_duty(Channel::Ch3, plan.ccr[2]);
+        self.inner.set_duty(Channel::Ch4, plan.ccr4);
+        analog.schedule_pair(plan.pair);
+    }
+
+    fn applied_duties(&self, plan: &SamplePlan) -> Duties {
         let max = self.max_duty as f32;
-        let ccr = |x: f32| (x * max).clamp(0.0, max) as u32;
-        self.inner.set_duty(Channel::Ch1, ccr(d.a));
-        self.inner.set_duty(Channel::Ch2, ccr(d.b));
-        self.inner.set_duty(Channel::Ch3, ccr(d.c));
-        self.set_ch4_sample(d);
+        Duties {
+            a: plan.ccr[0] as f32 / max,
+            b: plan.ccr[1] as f32 / max,
+            c: plan.ccr[2] as f32 / max,
+        }
     }
 }

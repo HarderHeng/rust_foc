@@ -12,7 +12,7 @@ use crate::driver::analog::AnalogSample;
 use crate::driver::pwm::with_pwm;
 use crate::foc::transforms::{clarke, wrap_2pi, Rotation};
 use crate::foc::{
-    CurrentLoop, Dq, DqFf, DutySink, FfOff, Modulator, PhaseCurrents, Svpwm, VoltageFeedforward,
+    CurrentLoop, Dq, DqFf, FfOff, Modulator, PhaseCurrents, Svpwm, VoltageFeedforward,
 };
 
 static LOOP: StaticCell<CurrentLoop> = StaticCell::new();
@@ -89,7 +89,6 @@ fn openloop_step(s: AnalogSample) {
     // Open-loop: do not use current-sign dead-time. Offset/noise flips the
     // sign every ISR and adds ~1.5% duty chatter (felt as strong cogging).
     let duties = Svpwm.modulate(rotation.inv_park(voltage), vbus);
-    telemetry::publish_duties(duties);
     apply_duties(duties);
 }
 
@@ -140,12 +139,21 @@ fn step(s: AnalogSample) {
 
     // Hardware TIM1 dead-time is already inserted. Current-sign software
     // compensation chatters while shunt offset is still being proven.
-    telemetry::publish_duties(duties);
     apply_duties(duties);
 }
 
 fn apply_duties(duties: crate::foc::Duties) {
-    let _ = with_pwm(|p| crate::driver::analog::with_analog(|a| (p, a).apply(duties)));
+    let applied = with_pwm(|p| {
+        let plan = p.plan(duties)?;
+        crate::driver::analog::with_analog(|a| p.apply_plan(&plan, a)).flatten()
+    })
+    .flatten();
+    if let Some(duties) = applied {
+        telemetry::publish_duties(duties);
+    } else {
+        // Reject an impossible sampling window instead of regulating on bad data.
+        control::fault(control::FaultKind::Adc);
+    }
 }
 
 fn enable_cyccnt() {

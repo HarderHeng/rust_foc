@@ -238,16 +238,20 @@ fn enter_mode(target: Mode, prepare: impl FnOnce()) -> bool {
             c: duty,
         };
         let enabled = with_pwm(|p| {
+            let plan = p.plan(duties).ok_or(FaultKind::Adc)?;
             analog::with_analog(|a| {
-                // Both current decoding and CCR4 must match the prepared duties.
-                crate::foc::DutySink::apply(a, duties);
-                p.prepare_start(duties)
+                // Current decoding, CCR4 and phase CCRs come from one plan.
+                if p.prepare_start(&plan, a) {
+                    Ok(())
+                } else {
+                    Err(FaultKind::Brake)
+                }
             })
-            .unwrap_or(false)
+            .unwrap_or(Err(FaultKind::Adc))
         })
-        .unwrap_or(false);
-        if !enabled {
-            fault(FaultKind::Brake);
+        .unwrap_or(Err(FaultKind::Adc));
+        if let Err(kind) = enabled {
+            fault(kind);
             return false;
         }
         LAST_FAULT.store(FaultKind::None as u8, Ordering::Relaxed);
@@ -380,7 +384,7 @@ pub fn cmd_timed_out() -> bool {
 
 /// Task-level completion watchdog. Wall time is independent of ADC IRQ progress.
 /// Diagnostic counter resets cannot pet this watchdog. CPU/task starvation still
-/// needs an independent hardware watchdog (not implemented here).
+/// needs the independent hardware watchdog in `driver::watchdog`.
 pub fn supervise_current(wall_ms: u32) {
     cortex_m::interrupt::free(|cs| {
         if !outputs_live() {
