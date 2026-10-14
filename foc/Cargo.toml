@@ -6,4 +6,4 @@ license = "MIT OR Apache-2.0"
 description = "Host-testable FOC math (Clarke/Park, PI, SVPWM)."
 
 [dependencies]
-micromath = "2.1.0"
+libm = "0.2.16"

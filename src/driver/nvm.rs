@@ -16,7 +16,9 @@ pub const PAGE_END: u32 = 0x2_0000;
 const ABS: u32 = 0x0800_0000 + PAGE_OFF;
 
 const MAGIC: u32 = 0x3143_4F46; // "FOC1"
-const VERSION: u16 = 1;
+                                // Version 1 may contain offsets from unqualified automatic alignments.
+                                // Fail closed on upgrade: re-align (or explicitly set a verified offset) and save.
+const VERSION: u16 = 2;
 const SLOT: usize = 16;
 
 #[derive(Clone, Copy, Debug)]

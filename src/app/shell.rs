@@ -468,7 +468,15 @@ impl Shell {
                 let _ = self.write_i32(app::iq_meas_ma() as i32).await;
                 let _ = self.write_all(b" mA off=").await;
                 let _ = self.write_i32(control::theta_e_off_mrad()).await;
-                let _ = self.write_all(b" mrad nvm=").await;
+                let _ = self.write_all(b" mrad cal=").await;
+                let _ = self
+                    .write_all(if control::calibration_valid() {
+                        b"ok"
+                    } else {
+                        b"required"
+                    })
+                    .await;
+                let _ = self.write_all(b" nvm=").await;
                 let _ = self
                     .write_all(if control::nvm_loaded() {
                         b"ok"
@@ -797,7 +805,7 @@ impl Shell {
     async fn write_blocked(&mut self) {
         let _ = self
             .write_all(
-                b"blocked: foc stop first; check fresh VBUS/NTC/encoder and fault status\r\n",
+                b"blocked: foc stop first; check sensors/faults; Run/Speed need cal=ok (align or verified offset)\r\n",
             )
             .await;
     }
@@ -807,8 +815,14 @@ impl Shell {
             let _ = self.write_all(b"nvm=ok\r\n").await;
         } else if control::outputs_live() {
             let _ = self.write_all(b"nvm=live (foc stop to save)\r\n").await;
+        } else if !control::calibration_valid() {
+            let _ = self
+                .write_all(b"nvm=uncalibrated (align or set verified offset first)\r\n")
+                .await;
         } else {
-            let _ = self.write_all(b"nvm=fail\r\n").await;
+            let _ = self
+                .write_all(b"nvm=fail (Idle required; check flash)\r\n")
+                .await;
         }
     }
 

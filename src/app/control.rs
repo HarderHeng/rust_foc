@@ -9,12 +9,15 @@ use cortex_m::interrupt::Mutex;
 use crate::app::speed as speed_loop;
 use crate::app::{foc_isr, telemetry};
 use crate::bsp::config::{
-    ALIGN_ID_MA, ALIGN_MS, CMD_TIMEOUT_MS, CURRENT_KI, CURRENT_KP, IDQ_RAMP_A_S, MAX_CURRENT_MA,
+    ALIGN_CURRENT_TOL_MA, ALIGN_ID_MA, ALIGN_MOTION_COUNTS, ALIGN_MS, ALIGN_TIMEOUT_MS,
+    CMD_TIMEOUT_MS, CURRENT_KI, CURRENT_KP, CURRENT_STALL_MS, IDQ_RAMP_A_S, MAX_CURRENT_MA,
     MOTOR_MAX_RPM, SPEED_IQ_RAMP_A_S, SPEED_KI, SPEED_KP, SPEED_RAMP_RPM_S, SPEED_RPM_MAX,
 };
 use crate::driver::analog;
 use crate::driver::nvm;
 use crate::driver::pwm::with_pwm;
+use crate::foc::alignment::{AlignResult, Alignment};
+use crate::foc::safety::ProgressWatch;
 use crate::foc::slew::SlewI32;
 use crate::foc::transforms::wrap_2pi;
 
@@ -72,6 +75,8 @@ pub enum FaultKind {
     CmdTimeout = 5,
     Brake = 6,
     Adc = 7,
+    ControlStall = 8,
+    Alignment = 9,
 }
 
 impl FaultKind {
@@ -84,6 +89,8 @@ impl FaultKind {
             5 => Self::CmdTimeout,
             6 => Self::Brake,
             7 => Self::Adc,
+            8 => Self::ControlStall,
+            9 => Self::Alignment,
             _ => Self::None,
         }
     }
@@ -98,6 +105,8 @@ impl FaultKind {
             Self::CmdTimeout => "timeout",
             Self::Brake => "brk",
             Self::Adc => "adc",
+            Self::ControlStall => "stall",
+            Self::Alignment => "align",
         }
     }
 }
@@ -122,8 +131,10 @@ static SPD_KI: AtomicU32 = AtomicU32::new(0);
 static LAST_FAULT: AtomicU8 = AtomicU8::new(FaultKind::None as u8);
 static NOW_MS: AtomicU32 = AtomicU32::new(0);
 static LAST_CMD_MS: AtomicU32 = AtomicU32::new(0);
-static ALIGN_START_MS: AtomicU32 = AtomicU32::new(0);
-static ALIGN_HOLDING: AtomicBool = AtomicBool::new(false);
+static CALIBRATION_VALID: AtomicBool = AtomicBool::new(false);
+static ALIGN_FEEDBACK_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+static ALIGNMENT: Mutex<Cell<Option<Alignment>>> = Mutex::new(Cell::new(None));
+static CURRENT_WATCH: Mutex<Cell<Option<ProgressWatch>>> = Mutex::new(Cell::new(None));
 
 #[derive(Clone, Copy)]
 struct ReferenceRamps {
@@ -203,10 +214,14 @@ pub fn sensor_fault(target: Mode) -> Option<FaultKind> {
 /// Changing between live modes requires an explicit stop.
 fn enter_mode(target: Mode, prepare: impl FnOnce()) -> bool {
     cortex_m::interrupt::free(|_| {
-        if mode() != Mode::Idle || sensor_fault(target).is_some() {
+        if mode() != Mode::Idle
+            || sensor_fault(target).is_some()
+            || (matches!(target, Mode::Run | Mode::Speed) && !calibration_valid())
+        {
             return false;
         }
         prepare();
+        cortex_m::interrupt::free(|cs| CURRENT_WATCH.borrow(cs).set(None));
         foc_isr::reset();
         foc_isr::reset_openloop();
         ID_MA.store(0, Ordering::Relaxed);
@@ -317,7 +332,10 @@ fn clear_references() {
     RPM_REF.store(0, Ordering::Relaxed);
     OL_VQ_MV.store(0, Ordering::Relaxed);
     OL_HZ.store(0, Ordering::Relaxed);
-    ALIGN_HOLDING.store(false, Ordering::Relaxed);
+    cortex_m::interrupt::free(|cs| {
+        ALIGNMENT.borrow(cs).set(None);
+        CURRENT_WATCH.borrow(cs).set(None);
+    });
     reset_ramps(0, 0, 0);
 }
 
@@ -360,6 +378,31 @@ pub fn cmd_timed_out() -> bool {
     now_ms().wrapping_sub(LAST_CMD_MS.load(Ordering::Relaxed)) > CMD_TIMEOUT_MS
 }
 
+/// Task-level completion watchdog. Wall time is independent of ADC IRQ progress.
+/// Diagnostic counter resets cannot pet this watchdog. CPU/task starvation still
+/// needs an independent hardware watchdog (not implemented here).
+pub fn supervise_current(wall_ms: u32) {
+    cortex_m::interrupt::free(|cs| {
+        if !outputs_live() {
+            CURRENT_WATCH.borrow(cs).set(None);
+            return;
+        }
+        let sequence = telemetry::control_sequence();
+        let healthy = {
+            let cell = CURRENT_WATCH.borrow(cs);
+            let mut watch = cell
+                .get()
+                .unwrap_or_else(|| ProgressWatch::new(sequence, wall_ms));
+            let healthy = watch.healthy(sequence, wall_ms, CURRENT_STALL_MS);
+            cell.set(Some(watch));
+            healthy
+        }; // Release the host mutex guard before fault resets the same state.
+        if !healthy {
+            fault(FaultKind::ControlStall);
+        }
+    });
+}
+
 /// 1 kHz supervisor: advance the control clock, then slew refs and align.
 /// `dt_ms` is wall time from the analog task (Embassy stays at that edge).
 pub fn tick(dt_ms: u32) {
@@ -381,42 +424,62 @@ pub fn calibrate_offsets() -> bool {
     analog::recalibrate()
 }
 
-/// Hold D-axis current with θe=0 for [`ALIGN_MS`] *after Id arrives*, then latch offset.
+/// Qualify measured D-axis current and rotor stability before latching offset.
 pub fn request_align(id_ma: Option<i32>) -> bool {
     enter_mode(Mode::Align, || {
         let id = id_ma.unwrap_or(ALIGN_ID_MA).clamp(1, MAX_CURRENT_MA);
         ID_TGT_MA.store(id, Ordering::Relaxed);
         IQ_TGT_MA.store(0, Ordering::Relaxed);
-        ALIGN_HOLDING.store(false, Ordering::Relaxed);
+        CALIBRATION_VALID.store(false, Ordering::Relaxed);
+        ALIGN_FEEDBACK_SEQUENCE.store(telemetry::control_sequence(), Ordering::Relaxed);
+        cortex_m::interrupt::free(|cs| ALIGNMENT.borrow(cs).set(Some(Alignment::new(now_ms()))));
     })
 }
 
-/// Call from a 1 ms task. Completes align after the hold window.
+/// Call from a 1 ms task. A lost qualification restarts the continuous hold.
 pub fn poll_align() {
-    if mode() != Mode::Align {
-        return;
-    }
-    if !ALIGN_HOLDING.load(Ordering::Relaxed) {
-        if (id_ma() - ID_TGT_MA.load(Ordering::Relaxed)).unsigned_abs() <= 2 {
-            ALIGN_HOLDING.store(true, Ordering::Relaxed);
-            ALIGN_START_MS.store(now_ms(), Ordering::Relaxed);
+    cortex_m::interrupt::free(|cs| {
+        if mode() != Mode::Align {
+            return;
         }
-        return;
-    }
-    if align_left_ms() == 0 {
-        finish_align();
-    }
+        let Some(mut alignment) = ALIGNMENT.borrow(cs).get() else {
+            return;
+        };
+        let target = id_target_ma();
+        // A small target must not qualify with zero measured current.
+        let tolerance = ALIGN_CURRENT_TOL_MA.min(target / 5);
+        let sequence = telemetry::control_sequence();
+        let previous = ALIGN_FEEDBACK_SEQUENCE.swap(sequence, Ordering::Relaxed);
+        let qualified = sequence != previous
+            && telemetry::enc_valid()
+            && (id_ma() - target).abs() <= 2
+            && (i32::from(telemetry::id_meas_ma()) - target).abs() <= tolerance
+            && i32::from(telemetry::iq_meas_ma()).abs() <= tolerance;
+        let result = alignment.observe(
+            now_ms(),
+            qualified,
+            telemetry::enc_raw(),
+            ALIGN_MS,
+            ALIGN_TIMEOUT_MS,
+            ALIGN_MOTION_COUNTS,
+        );
+        ALIGNMENT.borrow(cs).set(Some(alignment));
+        match result {
+            AlignResult::Complete => finish_align(),
+            AlignResult::TimedOut => fault(FaultKind::Alignment),
+            AlignResult::Pending => {}
+        }
+    });
 }
 
 pub fn align_left_ms() -> u32 {
-    if mode() != Mode::Align {
-        return 0;
-    }
-    if !ALIGN_HOLDING.load(Ordering::Relaxed) {
-        return ALIGN_MS;
-    }
-    let gone = now_ms().wrapping_sub(ALIGN_START_MS.load(Ordering::Relaxed));
-    ALIGN_MS.saturating_sub(gone)
+    cortex_m::interrupt::free(|cs| {
+        ALIGNMENT
+            .borrow(cs)
+            .get()
+            .map(|a| a.remaining_ms(now_ms(), ALIGN_MS))
+            .unwrap_or(0)
+    })
 }
 
 fn finish_align() {
@@ -516,7 +579,13 @@ pub fn set_poles(n: u8) -> bool {
         if mode() != Mode::Idle {
             return false;
         }
-        POLES.store(n.max(1), Ordering::Relaxed);
+        if n == 0 {
+            return false;
+        }
+        if poles() != n {
+            POLES.store(n, Ordering::Relaxed);
+            CALIBRATION_VALID.store(false, Ordering::Relaxed);
+        }
         true
     })
 }
@@ -542,6 +611,11 @@ pub fn pwm_pct() -> u8 {
 fn latch_electrical_offset() {
     let te = crate::foc::angle::park_theta_raw(telemetry::enc_raw(), 0.0, poles());
     THETA_E_OFF_MRAD.store((te * 1000.0) as i32, Ordering::Relaxed);
+    CALIBRATION_VALID.store(true, Ordering::Relaxed);
+}
+
+pub fn calibration_valid() -> bool {
+    CALIBRATION_VALID.load(Ordering::Relaxed)
 }
 
 pub fn capture_electrical_offset() -> bool {
@@ -561,21 +635,28 @@ pub fn set_theta_e_off_mrad(mrad: i32) -> bool {
         }
         let bounded = wrap_2pi(mrad as f32 / 1000.0);
         THETA_E_OFF_MRAD.store((bounded * 1000.0) as i32, Ordering::Relaxed);
+        // Explicit operator override, not an automatically qualified alignment.
+        CALIBRATION_VALID.store(true, Ordering::Relaxed);
         true
     })
 }
 
 /// Apply last flash record at boot. Missing/corrupt page leaves defaults.
 pub fn load_nvm() -> bool {
+    if mode() != Mode::Idle {
+        return false;
+    }
     match nvm::load() {
-        Some(r) => {
+        Some(r) if r.poles > 0 && (0..=6283).contains(&r.theta_e_off_mrad) => {
             THETA_E_OFF_MRAD.store(r.theta_e_off_mrad, Ordering::Relaxed);
-            POLES.store(r.poles.max(1), Ordering::Relaxed);
+            POLES.store(r.poles, Ordering::Relaxed);
+            CALIBRATION_VALID.store(true, Ordering::Relaxed);
             defmt::info!("nvm load off={} poles={}", r.theta_e_off_mrad, r.poles);
             true
         }
-        None => {
-            defmt::info!("nvm empty");
+        _ => {
+            CALIBRATION_VALID.store(false, Ordering::Relaxed);
+            defmt::info!("nvm empty or invalid");
             false
         }
     }
@@ -583,7 +664,7 @@ pub fn load_nvm() -> bool {
 
 /// Erase+program the NVM page. Refuses while PWM is live.
 pub fn persist_nvm() -> bool {
-    if outputs_live() {
+    if mode() != Mode::Idle || !calibration_valid() {
         return false;
     }
     nvm::save(nvm::Record {

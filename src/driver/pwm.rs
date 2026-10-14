@@ -1,6 +1,7 @@
 //! TIM1 complementary PWM for B-G431B-ESC1 phase pins.
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::cell::RefCell;
+use cortex_m::interrupt::Mutex;
 
 use embassy_stm32::gpio::{OutputType, Pull, Speed};
 use embassy_stm32::pac::timer::vals::Ocm;
@@ -15,13 +16,11 @@ use embassy_stm32::timer::low_level::{CountingMode, MasterMode};
 use embassy_stm32::timer::simple_pwm::{PwmPin, PwmPinConfig};
 use embassy_stm32::timer::Channel;
 use embassy_stm32::Peri;
-use static_cell::StaticCell;
 
 use crate::bsp::config::{pwm_deadtime_ticks, tw_after_ticks, tw_before_ticks, PWM_FREQ_HZ};
 use crate::foc::{Duties, DutySink};
 
-static PWM: StaticCell<MotorPwm> = StaticCell::new();
-static PWM_PTR: AtomicPtr<MotorPwm> = AtomicPtr::new(core::ptr::null_mut());
+static PWM: Mutex<RefCell<Option<MotorPwm>>> = Mutex::new(RefCell::new(None));
 
 fn pwm_pin_cfg() -> PwmPinConfig {
     PwmPinConfig {
@@ -31,25 +30,41 @@ fn pwm_pin_cfg() -> PwmPinConfig {
     }
 }
 
-pub fn init_pwm(pwm: MotorPwm) -> &'static mut MotorPwm {
-    let slot = PWM.init(pwm);
-    PWM_PTR.store(slot as *mut MotorPwm, Ordering::Release);
-    slot
+pub fn init_pwm(pwm: MotorPwm) {
+    cortex_m::interrupt::free(|cs| {
+        let mut slot = PWM.borrow(cs).borrow_mut();
+        assert!(slot.is_none(), "PWM already initialized");
+        *slot = Some(pwm);
+    });
 }
 
-/// ISR-safe: short critical section, no Embassy mutex.
+/// ISR-safe, checked exclusive borrow. Reentrant calls return None.
 pub fn with_pwm<R>(f: impl FnOnce(&mut MotorPwm) -> R) -> Option<R> {
-    cortex_m::interrupt::free(|_| {
-        let p = PWM_PTR.load(Ordering::Acquire);
-        if p.is_null() {
-            None
-        } else {
-            Some(f(unsafe { &mut *p }))
-        }
+    cortex_m::interrupt::free(|cs| {
+        let mut slot = PWM.borrow(cs).try_borrow_mut().ok()?;
+        slot.as_mut().map(f)
     })
 }
 
-/// Six-switch TIM1 driver. Outputs stay idle-low until [`MotorPwm::enable`].
+/// Terminal panic/HardFault path only: no shared borrow, allocation or logging.
+/// Interrupts remain disabled; normal firmware execution must never resume.
+pub fn emergency_shutdown() -> ! {
+    cortex_m::interrupt::disable();
+    TIM1_PAC.bdtr().modify(|w| w.set_moe(false));
+    // Also disconnect all six gate outputs, independently of the MOE idle setup.
+    TIM1_PAC.ccer().modify(|w| {
+        for ch in 0..3 {
+            w.set_cce(ch, false);
+            w.set_ccne(ch, false);
+        }
+    });
+    cortex_m::asm::dsb();
+    loop {
+        cortex_m::asm::nop();
+    }
+}
+
+/// Six-switch TIM1 driver. Outputs stay idle-low until [`MotorPwm::prepare_start`].
 pub struct MotorPwm {
     inner: ComplementaryPwm<'static, TIM1>,
     max_duty: u32,

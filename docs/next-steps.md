@@ -20,17 +20,18 @@
 - `foc isr` 增加 JEOS 处理耗时、最大值、调用次数和超预算计数。
 - 增加 FOC 算法测试、控制状态机安全回归测试、计时统计测试和验收说明。
 - 固件、算法测试、Clippy、格式检查和 release 构建已经通过。
+- 生产数学统一为 `libm`，并增加链接生产库的电压限幅和旋转精度测试。
+- 增加电流控制停更监督（5 ms，`fault=stall`）、panic/HardFault 关闭 TIM1 输出。
+- 对齐改为基于实测电流、编码器有效和转子静止的连续保持判定；失败触发 `fault=align`。
+- Run/Speed 增加校准有效性互锁；修改极对数使校准失效；NVM 升级到版本 2。
+- 增加带单命令超时的 `scripts/check.py`。
+
+仍未解决：高占空比采样窗口规划、独立硬件 watchdog、真实板卡时序验收。
 
 当前测试基线：
 
 ```text
-cargo htest --locked --offline                         49 个算法测试 + 1 个控制安全测试通过
-cargo check --release --locked --offline               通过
-cargo clippy --release --locked --offline -- -D warnings 通过
-cargo clippy -p foc --target x86_64-unknown-linux-gnu \
-  --all-targets --locked --offline -- -D warnings      通过
-cargo fmt --all -- --check                             通过
-cargo build --release --locked --offline               通过
+scripts/check.py --offline  53 个单元测试 + 1 个控制安全测试 + 2 个生产数学测试，及 fmt/check/clippy
 ```
 
 ## 2. 当前硬件阻塞项

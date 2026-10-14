@@ -25,6 +25,7 @@ impl Handler<interrupt::typelevel::ADC1_2> for AdcJeos {
             ADC2.isr().write(|r| r.set_jeos(true));
             if let Some(s) = analog::with_analog(|a| a.read_currents()) {
                 foc_isr::on_injected(s);
+                telemetry::publish_control_completion();
             }
             // Also records early-return fault/idle paths and unavailable samples.
             let end = cortex_m::peripheral::DWT::cycle_count();

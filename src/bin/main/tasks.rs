@@ -82,6 +82,7 @@ pub async fn analog_task() {
                 control::fault(control::FaultKind::CmdTimeout);
             }
         }
+        control::supervise_current(now_ms as u32);
         control::tick(dt_ms);
         Timer::after_millis(1).await;
     }

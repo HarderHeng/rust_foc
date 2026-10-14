@@ -1,8 +1,5 @@
 //! Clarke / Park and inverses.
 
-#[allow(unused_imports)]
-use micromath::F32Ext;
-
 use super::types::{AlphaBeta, Dq, PhaseAbc};
 
 const SQRT3_INV: f32 = 0.577_350_26;
@@ -43,7 +40,8 @@ pub struct Rotation {
 impl Rotation {
     #[inline]
     pub fn new(theta: f32) -> Self {
-        let (sin, cos) = theta.sin_cos();
+        // Explicit backend: host tests and no_std firmware must execute the same math.
+        let (sin, cos) = libm::sincosf(theta);
         Self { sin, cos }
     }
 

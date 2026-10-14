@@ -4,14 +4,25 @@
 #![no_main]
 
 use defmt::unwrap;
+use defmt_rtt as _;
 use embassy_executor::Spawner;
-use {defmt_rtt as _, panic_probe as _};
 
 use stm32g431_foc::bsp;
 
 mod bringup;
 mod irqs;
 mod tasks;
+
+// Never log or acquire a shared PWM borrow before shutting down the power stage.
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    stm32g431_foc::driver::pwm::emergency_shutdown()
+}
+
+#[cortex_m_rt::exception]
+unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
+    stm32g431_foc::driver::pwm::emergency_shutdown()
+}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {

@@ -31,9 +31,43 @@ impl Freshness {
     }
 }
 
+/// Tracks a wrapping, non-saturating completion sequence independently of diagnostics.
+#[derive(Clone, Copy)]
+pub struct ProgressWatch {
+    sequence: u32,
+    age: Freshness,
+}
+
+impl ProgressWatch {
+    pub fn new(sequence: u32, now_ms: u32) -> Self {
+        let mut age = Freshness::new();
+        age.refresh(now_ms);
+        Self { sequence, age }
+    }
+
+    pub fn healthy(&mut self, sequence: u32, now_ms: u32, timeout_ms: u32) -> bool {
+        if sequence != self.sequence {
+            self.sequence = sequence;
+            self.age.refresh(now_ms);
+        }
+        self.age.is_fresh(now_ms, timeout_ms)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_requires_completions_not_diagnostic_resets() {
+        let mut watch = ProgressWatch::new(u32::MAX, u32::MAX - 1);
+        assert!(watch.healthy(u32::MAX, 0, 5));
+        assert!(watch.healthy(0, 1, 5)); // Both clocks may wrap.
+        assert!(watch.healthy(0, 5, 5));
+        assert!(!watch.healthy(0, 6, 5));
+        assert!(!watch.healthy(0, 1, 5)); // Expiration is latched.
+        assert!(watch.healthy(1, 7, 5));
+    }
 
     #[test]
     fn missing_expired_and_invalid_samples_are_rejected() {

@@ -91,6 +91,9 @@ pub const AS5600_PERIOD_US: u32 = 400;
 pub const ENC_FAULT_MS: u32 = 20;
 /// Maximum age of a complete VBUS/NTC pair (normally refreshed every ~2 ms).
 pub const BUS_FAULT_MS: u32 = 20;
+/// Supervisor must observe current-control completion within this interval.
+/// A task-level watchdog, NOT a substitute for an independent hardware watchdog.
+pub const CURRENT_STALL_MS: u32 = 5;
 
 pub fn adc_to_amps(counts: u16, offset: u16) -> f32 {
     let volts = (counts as f32 - offset as f32) * (ADC_VREF / ADC_FULL_SCALE);

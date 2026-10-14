@@ -26,9 +26,28 @@
 - Stop and fault clear current/speed/open-loop references. The first fault cause is
   retained until a successful restart. `foc stop` acknowledges Fault but does not
   bypass sensor or hardware-break interlocks on the next start.
-- Pole pairs and electrical offset can only be changed in Idle. After changing pole
-  pairs, perform alignment again before running; automatic alignment-validity tracking
-  is not yet implemented.
+- Pole pairs and electrical offset can only be changed in Idle. Run/Speed require valid
+  calibration (`cal=ok`): a qualified alignment, a valid NVM version-2 record, or an
+  explicit operator-entered offset. Changing pole pairs invalidates calibration;
+  setting the same value does not. NVM version 1 records are ignored on upgrade because
+  they may have been written by the earlier unqualified alignment. Uncalibrated state
+  cannot be saved. Openloop and Bench do not require rotor calibration.
+- Alignment is qualified on the supervisor using fresh current-loop completions,
+  measured Id within `min(100 mA, target/5)` of target, measured |Iq| within the same
+  tolerance, a valid encoder, and rotor motion of at most 8 counts throughout a
+  continuous 500 ms hold. A loss of qualification or a poll gap above 5 ms restarts the
+  hold. Timeout after 2 s trips `fault=align`, disables PWM, invalidates calibration,
+  and keeps the previous offset. The thresholds require unloaded board review.
+- The supervisor trips `fault=stall` if live outputs observe no current-control
+  completion for 5 ms. The completion sequence is separate from `foc isr` diagnostics,
+  so a statistics reset cannot pet it. This does not detect a stalled executor or CPU.
+- Panic and HardFault disable TIM1 MOE and CH1-3/CH1N-3, without logging or shared
+  borrows, then halt with interrupts disabled. PWM access uses a checked
+  `Mutex<RefCell<Option<_>>>` rather than an escaping mutable reference.
+- AS5600 samples are invalid when the magnet is missing, too weak, or too strong.
+- Production math explicitly uses `libm` (`sqrtf`, `sincosf`) on host tests and firmware.
+  Integration tests link the non-test library and verify voltage-limit magnitudes and
+  rotation accuracy. Timing impact must be measured on the board.
 - Encoder control angle is single-turn. Multi-turn position remains integer counts;
   speed is derived from signed count differences. `enc mdeg` now reports single-turn
   position rather than an ever-growing floating-point angle.
@@ -41,6 +60,9 @@
   the fractional part of each polling interval. Zero elapsed time does not advance it.
 - Park and inverse Park share one sin/cos pair per current or open-loop step.
   ADC timing, regulator gains and release optimization level are unchanged.
+- Known open item: the high-duty current sample trigger may still choose a phase whose
+  low-side window is not open (for example duties near 0.933/0.933/0.067). Do not run
+  near modulation saturation until the trigger/pair planner is corrected and scoped.
 
 ## IRQ timing diagnostics
 
@@ -71,20 +93,20 @@ is claimed from host tests or the shared-rotation refactor alone.
 ## Host checks
 
 ```sh
-cargo htest --locked
-cargo check --release --locked
-cargo clippy --release --locked -- -D warnings
-cargo clippy -p foc --target x86_64-unknown-linux-gnu --all-targets --locked -- -D warnings
-cargo fmt --all -- --check
-cargo build --release --locked  # requires flip-link
+scripts/check.py --offline
+scripts/check.py --offline --build  # requires flip-link
 ```
+
+Each command has a 120 s deadline and its process group is killed on timeout.
 
 `foc/tests/control_safety.rs` imports the actual firmware control implementation and
 mocks the hardware edges. Its interrupt model queues faults until the outermost
 critical section exits, exercising both a fault during reset and a fault at PWM enable.
 It also checks sensor interlocks, cleared stop targets, first-fault retention, rejected
 live parameter changes, repeated RPM commands retaining controller state, exact elapsed-time
-reference ramps, and fractional-state clearing across stop/fault. Pure tests cover slow
+reference ramps, fractional-state clearing across stop/fault, calibration interlocks,
+alignment failure/restart/success, pole-change invalidation, and the current-control
+stall trip in every live mode. Pure tests cover slow
 and negative ramps, reversal, jittered intervals, integer limits, DWT wrap, diagnostic
 counter saturation, and rotation equations.
 These tests do **not** validate ADC/TIM1 electrical timing or real IRQ latency.
@@ -114,7 +136,12 @@ core with SWD while PWM is enabled. Do not treat a successful host test as board
    but excludes entry/exit, scheduling latency and final statistics publication.
 7. **Duration:** run an unloaded endurance test through repeated mechanical revolutions;
    electrical-angle resolution must not degrade with accumulated position.
+8. **New trips:** verify `fault=stall` by suppressing JEOS in a dedicated test build;
+   verify panic and HardFault disable all six outputs within an acceptable time.
+9. **Alignment:** verify success, tolerance, rotor-motion detection and timeout with a
+   current-limited unloaded motor; check that a failed alignment keeps the old offset.
 
-Remaining work includes board-level end-to-end IRQ timing measurements, minimizing critical
-sections after measurement, alignment-quality validation, and hardware watchdog integration.
+Remaining work includes the high-duty sampling planner, an independent hardware
+watchdog, board-level end-to-end IRQ timing measurements, and minimizing critical
+sections after measurement.
 NVM writes still require PWM off and can stall flash execution.

@@ -73,7 +73,7 @@ impl As5600 {
         {
             return self.hold(status);
         }
-        if !status.magnet_ok || status.too_weak {
+        if !status.magnet_ok || status.too_weak || status.too_strong {
             return self.hold(status);
         }
 

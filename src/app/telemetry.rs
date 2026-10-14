@@ -120,6 +120,16 @@ static UQ_MV: AtomicI16 = AtomicI16::new(0);
 static UD_REF_MV: AtomicI16 = AtomicI16::new(0);
 static UQ_REF_MV: AtomicI16 = AtomicI16::new(0);
 static ISR_STATS: Mutex<Cell<CycleStats>> = Mutex::new(Cell::new(CycleStats::new()));
+// Separate from resettable/saturating diagnostics: increments only after a sample is serviced.
+static CONTROL_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+
+pub fn publish_control_completion() {
+    CONTROL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn control_sequence() -> u32 {
+    CONTROL_SEQUENCE.load(Ordering::Relaxed)
+}
 /// One PWM period, not an allowance for exception entry/exit or scheduling latency.
 pub const ISR_BUDGET_CYCLES: u32 = SYSCLK_FREQ_HZ / PWM_FREQ_HZ;
 static DA_PPT: AtomicU16 = AtomicU16::new(0);

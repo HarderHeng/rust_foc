@@ -1,8 +1,5 @@
 //! Inverse Clarke + midpoint SVPWM.
 
-#[allow(unused_imports)]
-use micromath::F32Ext;
-
 use super::traits::{DutyMap, Modulator, VoltageLimiter};
 use super::transforms::inv_clarke;
 use super::types::{AlphaBeta, Duties, PhaseAbc};
@@ -58,7 +55,7 @@ pub struct CircleLimit;
 
 impl VoltageLimiter for CircleLimit {
     fn limit(&self, vd: f32, vq: f32, vmax: f32) -> (f32, f32) {
-        let mag = (vd * vd + vq * vq).sqrt();
+        let mag = libm::sqrtf(vd * vd + vq * vq);
         if mag > vmax && mag > 1e-6 {
             let s = vmax / mag;
             (vd * s, vq * s)
@@ -76,7 +73,7 @@ impl VoltageLimiter for VdPriority {
     fn limit(&self, vd: f32, vq: f32, vmax: f32) -> (f32, f32) {
         let vmax = vmax.max(0.0);
         let vd = vd.clamp(-vmax, vmax);
-        let qmax = (vmax * vmax - vd * vd).max(0.0).sqrt();
+        let qmax = libm::sqrtf((vmax * vmax - vd * vd).max(0.0));
         (vd, vq.clamp(-qmax, qmax))
     }
 }

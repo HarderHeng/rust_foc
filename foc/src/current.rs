@@ -1,8 +1,5 @@
 //! One PWM-period current loop (PI → feed-forward → limit → SVPWM).
 
-#[allow(unused_imports)]
-use micromath::F32Ext;
-
 use super::pid::Pi;
 use super::svm::{Svpwm, VdPriority};
 use super::traits::{Modulator, PhaseCurrents, Regulator, VoltageFeedforward, VoltageLimiter};
@@ -26,7 +23,7 @@ pub fn flux_from_ke_vrms_ll_krpm(ke: f32, pole_pairs: f32) -> f32 {
     if omega_e < 1e-6 {
         0.0
     } else {
-        ke * core::f32::consts::SQRT_2 / 3.0f32.sqrt() / omega_e
+        ke * core::f32::consts::SQRT_2 / libm::sqrtf(3.0) / omega_e
     }
 }
 

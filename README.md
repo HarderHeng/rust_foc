@@ -7,15 +7,15 @@ Embassy Rust FOC for **STM32G431CB** boards electrically compatible with ST B-G4
 - **Motor nameplate** is one file: [`src/bsp/motor.rs`](src/bsp/motor.rs). Swap or edit it for another machine. Runtime: `foc poles`, `foc kp|ki|skp|ski`, `foc motor`, `foc save`.
 - Math lives in the `foc/` crate (`cargo htest`). Firmware re-exports it as `crate::foc`.
 
-**Design:** [current-loop spec](docs/superpowers/specs/2026-09-21-stm32g431-foc-current-loop.md) · [plan](docs/superpowers/plans/2026-09-21-stm32g431-foc-current-loop.md)  
-**Bring-up (clock/LED/UART):** [2026-04-03 spec](docs/superpowers/specs/2026-04-03-stm32g431-foc-design.md)
+**Design:** [current-loop spec](docs/specs/2026-09-21-stm32g431-foc-current-loop.md) · [plan](docs/plans/2026-09-21-stm32g431-foc-current-loop.md)  
+**Bring-up (clock/LED/UART):** [2026-04-03 spec](docs/specs/2026-04-03-stm32g431-foc-design.md)
 
 ## Build
 
 ```bash
-cargo check --lib --bins --locked # thumbv7em-none-eabihf
-cargo htest --locked              # algorithms + host control-state regression tests
-probe-rs run --chip STM32G431CB   # default cargo runner
+scripts/check.py --offline        # fmt, host tests, check, clippy; 120 s deadline per command
+scripts/check.py --offline --build  # also links release firmware (requires flip-link)
+probe-rs run --chip STM32G431CB   # default cargo runner; board acceptance only
 ```
 
 USART2 is **921600** 8N1 (PB3 TX / PB4 RX). Tune and watch the loop on this UART (`foc status`, `foc isr`). Do not halt the core with a probe-rs/SWD breakpoint while PWM is live.
@@ -27,13 +27,18 @@ USART2 is **921600** 8N1 (PB3 TX / PB4 RX). Tune and watch the loop on this UART
 ```text
 foc stop
 cal current
-foc align          # or: foc align 500  (RAM offset; `foc save` writes flash)
-foc status         # off=… mrad nvm=ok|empty, fault=none
+foc align          # or: foc align 500; qualified hold, RAM offset
+foc status         # cal=ok required for Run/Speed; fault=none
+foc save           # optional: persist the qualified offset
 foc start
 foc iq 200         # mA, slewed at 10 A/s
 ```
 
 `foc stop` coasts (MOE off) and clears all current/speed/open-loop targets. `foc status` keeps the last `fault=` after stop. Starts require fresh, in-range VBUS/NTC; Align/Run/Speed also require a valid AS5600 magnet. Change live modes only after `foc stop`. Repeated `foc rpm` commands update the target without restarting the controllers.
+
+Run/Speed require `cal=ok`: a qualified alignment, a valid version-2 NVM record, or an explicitly entered verified offset (`foc offset <mrad>`). Firmware with NVM version 2 intentionally ignores older records; re-align and save once after upgrading. Changing pole pairs invalidates calibration.
+
+Alignment completes only after continuous fresh current-loop feedback with measured Id near target, Iq near zero, a valid encoder, and rotor motion within the configured limit. Otherwise it trips `fault=align` after 2 s and keeps the previous offset. Live outputs trip `fault=stall` if the supervisor sees no current-control completion for 5 ms. Panic and HardFault disable TIM1 outputs before halting. These are software protections; a hardware watchdog is still required.
 
 VBUS/NTC are sampled while running. Missing bus data trips `fault=adc`; encoder errors trip immediately, and stale samples time out after 20 ms. Pole pairs and offset can only be edited in Idle. Encoder position is single-turn; accumulated turns no longer reduce Park-angle precision.
 

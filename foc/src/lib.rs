@@ -2,6 +2,7 @@
 
 #![no_std]
 
+pub mod alignment;
 pub mod angle;
 pub mod current;
 pub mod pid;

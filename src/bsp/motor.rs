@@ -36,6 +36,10 @@ pub const CURRENT_KI: f32 = MOTOR_RS_OHM * CURRENT_BW_RAD;
 /// Forced-D align hold current (mA).
 pub const ALIGN_ID_MA: i32 = 500;
 pub const ALIGN_MS: u32 = 500;
+/// Qualification settings need unloaded board acceptance before loaded operation.
+pub const ALIGN_TIMEOUT_MS: u32 = 2_000;
+pub const ALIGN_CURRENT_TOL_MA: i32 = 100;
+pub const ALIGN_MOTION_COUNTS: i32 = 8;
 
 /// Speed PI first tune (A/rpm, A/(rpm·s)). Empty-shaft gain is high on this KV.
 pub const SPEED_LOOP_HZ: u32 = 10;

@@ -96,6 +96,19 @@ pub mod app {
         pub static ENC_VALID: AtomicBool = AtomicBool::new(false);
         pub static VBUS: AtomicI32 = AtomicI32::new(24_000);
         pub static TEMP: AtomicI32 = AtomicI32::new(250);
+        pub static ID_MEAS: AtomicI32 = AtomicI32::new(0);
+        pub static IQ_MEAS: AtomicI32 = AtomicI32::new(0);
+        pub static RAW: AtomicI32 = AtomicI32::new(100);
+        pub static SEQUENCE: AtomicI32 = AtomicI32::new(0);
+        pub fn control_sequence() -> u32 {
+            SEQUENCE.load(SeqCst) as u32
+        }
+        pub fn id_meas_ma() -> i16 {
+            ID_MEAS.load(SeqCst) as i16
+        }
+        pub fn iq_meas_ma() -> i16 {
+            IQ_MEAS.load(SeqCst) as i16
+        }
         pub fn bus_snapshot() -> (u16, i16, bool) {
             (
                 VBUS.load(SeqCst) as u16,
@@ -107,7 +120,7 @@ pub mod app {
             ENC_VALID.load(SeqCst)
         }
         pub fn enc_raw() -> u16 {
-            100
+            RAW.load(SeqCst) as u16
         }
         pub fn rpm_meas() -> i32 {
             100
@@ -200,6 +213,67 @@ fn control_safety_regressions() {
     t::TEMP.store(800, SeqCst);
     assert!(!c::start(), "overtemperature must block start");
     t::TEMP.store(250, SeqCst);
+
+    assert!(!c::calibration_valid());
+    assert!(!c::load_nvm());
+    assert!(!c::start(), "missing calibration blocks Run");
+    assert!(!c::start_speed(100), "missing calibration blocks Speed");
+    assert!(!c::persist_nvm(), "cannot save an unqualified default");
+    assert!(
+        c::start_openloop(500, 2),
+        "Openloop does not need rotor zero"
+    );
+    c::stop();
+
+    // Reference arrival alone cannot complete alignment, even at a tiny target.
+    let old_offset = c::theta_e_off_mrad();
+    assert!(c::request_align(Some(1)));
+    for _ in 0..crate::bsp::config::ALIGN_TIMEOUT_MS {
+        t::SEQUENCE.fetch_add(1, SeqCst);
+        c::tick(1);
+    }
+    assert!(c::mode() == Mode::Fault);
+    assert!(c::last_fault() == FaultKind::Alignment);
+    assert!(!c::calibration_valid());
+    assert_eq!(c::theta_e_off_mrad(), old_offset);
+    assert!(!PWM.lock().unwrap().enabled);
+    c::stop();
+
+    assert!(c::request_align(None));
+    t::ID_MEAS.store(500, SeqCst);
+    for _ in 0..300 {
+        t::SEQUENCE.fetch_add(1, SeqCst);
+        c::tick(1);
+    }
+    // Motion and bad feedback each restart the hold.
+    t::RAW.store(200, SeqCst);
+    t::SEQUENCE.fetch_add(1, SeqCst);
+    c::tick(1);
+    assert_eq!(c::align_left_ms(), crate::bsp::config::ALIGN_MS);
+    t::ID_MEAS.store(0, SeqCst);
+    t::SEQUENCE.fetch_add(1, SeqCst);
+    c::tick(1);
+    t::ID_MEAS.store(500, SeqCst);
+    for _ in 0..500 {
+        t::SEQUENCE.fetch_add(1, SeqCst);
+        c::tick(1);
+    }
+    assert!(c::mode() == Mode::Align, "full continuous hold required");
+    t::SEQUENCE.fetch_add(1, SeqCst);
+    c::tick(1);
+    assert!(c::mode() == Mode::Idle);
+    assert!(c::calibration_valid());
+    assert!(!PWM.lock().unwrap().enabled);
+    let poles = c::poles();
+    assert!(!c::set_poles(0));
+    assert!(c::set_poles(poles));
+    assert!(c::calibration_valid());
+    assert!(c::set_poles(poles + 1));
+    assert!(!c::calibration_valid());
+    assert!(!c::start());
+    // Manual offset is an explicit operator override.
+    assert!(c::set_theta_e_off_mrad(200));
+    assert!(c::calibration_valid());
 
     c::set_id_ma(200);
     c::set_iq_ma(300);
@@ -295,4 +369,39 @@ fn control_safety_regressions() {
     assert!(!PWM.lock().unwrap().enabled);
     PWM.lock().unwrap().break_pending = false;
     c::stop();
+
+    // All live modes, including Bench and Openloop, require ADC progress.
+    for mode in [
+        Mode::Run,
+        Mode::Speed,
+        Mode::Bench,
+        Mode::Openloop,
+        Mode::Align,
+    ] {
+        assert!(c::set_theta_e_off_mrad(200));
+        assert!(match mode {
+            Mode::Run => c::start(),
+            Mode::Speed => c::start_speed(100),
+            Mode::Bench => c::start_bench(),
+            Mode::Openloop => c::start_openloop(500, 2),
+            Mode::Align => c::request_align(None),
+            _ => unreachable!(),
+        });
+        c::supervise_current(100);
+        c::supervise_current(104);
+        assert!(c::mode() == mode);
+        t::SEQUENCE.fetch_add(1, SeqCst);
+        c::supervise_current(105);
+        c::supervise_current(109);
+        assert!(c::mode() == mode);
+        c::supervise_current(110);
+        assert!(c::mode() == Mode::Fault);
+        assert!(c::last_fault() == FaultKind::ControlStall);
+        assert!(!PWM.lock().unwrap().enabled);
+        assert_eq!(
+            (c::id_target_ma(), c::iq_target_ma(), c::rpm_target()),
+            (0, 0, 0)
+        );
+        c::stop();
+    }
 }
