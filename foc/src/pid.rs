@@ -131,6 +131,9 @@ impl Pid {
         let (lo, hi) = ordered(out_min, out_max);
         self.out_min = lo;
         self.out_max = hi;
+        if !lo.is_finite() || !hi.is_finite() {
+            return;
+        }
         self.integ = self.integ.clamp(lo, hi);
         self.last_out = self.last_out.clamp(lo, hi);
     }
@@ -160,9 +163,16 @@ impl Pid {
     /// `applied` is this regulator's share only (command minus any feed-forward
     /// the caller added). Voltage circle / SVM stay in the caller.
     pub fn track(&mut self, applied: f32) {
+        if !applied.is_finite() || !self.valid_limits() {
+            return;
+        }
         let applied = applied.clamp(self.out_min, self.out_max);
         if let AntiWindup::BackCalc { kaw } = self.anti_windup {
-            self.integ += kaw * (applied - self.last_out);
+            let integ = self.integ + kaw * (applied - self.last_out);
+            if !integ.is_finite() {
+                return;
+            }
+            self.integ = integ;
         }
         self.last_out = applied;
     }
@@ -176,8 +186,14 @@ impl Pid {
         self.step_in(PidIn::meas(sp, meas, dt))
     }
 
+    /// Invalid samples/configuration or arithmetic overflow return NaN without
+    /// changing controller history. Callers must reject that output; replacing
+    /// bad feedback with a plausible torque command would conceal the failure.
     pub fn step_in(&mut self, input: PidIn) -> f32 {
-        let dt = input.dt.max(0.0);
+        let dt = input.dt;
+        if !dt.is_finite() || dt < 0.0 || !self.valid_limits() {
+            return f32::NAN;
+        }
         let meas = input.meas;
         let err_i = match (input.error, meas) {
             (Some(e), _) => e,
@@ -191,19 +207,28 @@ impl Pid {
         };
 
         let p = self.kp * err_p;
-        let d = self.derivative(err_i, meas, dt);
+        let (d, d_state) = self.derivative(err_i, meas, dt);
 
+        let mut integ = self.integ;
         if self.should_integrate(err_i) {
-            self.integ += self.ki * err_i * dt;
+            integ += self.ki * err_i * dt;
         }
 
-        let unsat = p + self.integ + d;
+        let unsat = p + integ + d;
+        if !err_i.is_finite() || !unsat.is_finite() {
+            return f32::NAN;
+        }
         let sat = unsat.clamp(self.out_min, self.out_max);
 
         if let AntiWindup::BackCalc { kaw } = self.anti_windup {
-            self.integ += kaw * (sat - unsat);
+            integ += kaw * (sat - unsat);
+        }
+        if !integ.is_finite() {
+            return f32::NAN;
         }
 
+        self.integ = integ;
+        self.d_state = d_state;
         self.prev_err = err_i;
         if let Some(y) = meas {
             self.prev_meas = y;
@@ -225,10 +250,13 @@ impl Pid {
         }
     }
 
-    fn derivative(&mut self, err: f32, meas: Option<f32>, dt: f32) -> f32 {
+    fn valid_limits(&self) -> bool {
+        self.out_min.is_finite() && self.out_max.is_finite() && self.out_min <= self.out_max
+    }
+
+    fn derivative(&self, err: f32, meas: Option<f32>, dt: f32) -> (f32, f32) {
         if self.kd == 0.0 || dt <= 0.0 {
-            self.d_state = 0.0;
-            return 0.0;
+            return (0.0, 0.0);
         }
 
         let raw = if self.d_on_meas {
@@ -248,8 +276,7 @@ impl Pid {
         } else {
             raw
         };
-        self.d_state = d;
-        self.kd * d
+        (self.kd * d, d)
     }
 }
 
@@ -276,7 +303,9 @@ impl crate::traits::Regulator for Pid {
 }
 
 fn ordered(a: f32, b: f32) -> (f32, f32) {
-    if a <= b {
+    if !a.is_finite() || !b.is_finite() {
+        (f32::NAN, f32::NAN)
+    } else if a <= b {
         (a, b)
     } else {
         (b, a)

@@ -105,35 +105,7 @@ pub(super) fn parse_u8(s: Option<&str>) -> Option<u8> {
 }
 
 pub(super) fn parse_f32(s: Option<&str>) -> Option<f32> {
-    let s = s?;
-    let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
-        (true, r)
-    } else {
-        (false, s.strip_prefix('+').unwrap_or(s))
-    };
-    if rest.is_empty() {
-        return None;
-    }
-    let mut it = rest.splitn(2, '.');
-    let ip = it.next()?;
-    let fp = it.next().unwrap_or("");
-    if ip.is_empty() && fp.is_empty() {
-        return None;
-    }
-    let mut v = if ip.is_empty() {
-        0.0
-    } else {
-        ip.parse::<u32>().ok()? as f32
-    };
-    if !fp.is_empty() {
-        let frac = fp.parse::<u32>().ok()? as f32;
-        let mut den = 1.0f32;
-        for _ in 0..fp.len() {
-            den *= 10.0;
-        }
-        v += frac / den;
-    }
-    Some(if neg { -v } else { v })
+    s?.parse::<f32>().ok().filter(|v| v.is_finite())
 }
 
 pub(super) fn fmt_i32(v: i32, out: &mut [u8; 12]) -> usize {
@@ -170,6 +142,21 @@ pub(super) fn fmt_i32(v: i32, out: &mut [u8; 12]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tuning_values_accept_exponents_and_long_decimals_but_not_nonfinite() {
+        for (text, expected) in [
+            ("2e-3", 0.002),
+            ("+5100", 5100.0),
+            (".000000000123", 1.23e-10),
+        ] {
+            assert_eq!(parse_f32(Some(text)), Some(expected));
+        }
+        for text in ["", ".", "+", "NaN", "inf", "-inf", "1e1000", "1.2.3"] {
+            assert_eq!(parse_f32(Some(text)), None, "{text}");
+        }
+        assert_eq!(parse_f32(None), None);
+    }
 
     #[test]
     fn crlf_submits_once() {

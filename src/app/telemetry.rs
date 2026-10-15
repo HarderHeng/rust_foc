@@ -1,12 +1,16 @@
 //! Sensor snapshots and current-IRQ diagnostics shared with the shell.
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicU16, AtomicU32, Ordering};
 use cortex_m::interrupt::Mutex;
 use embassy_time::Instant;
 
-use crate::bsp::config::{BUS_FAULT_MS, ENC_FAULT_MS, PWM_FREQ_HZ, SYSCLK_FREQ_HZ};
+use crate::bsp::config::{
+    BUS_FAULT_MS, ENC_FAULT_MS, ENC_SPEED_MAX_GAP_US, PWM_FREQ_HZ, SPEED_RPM_WINDOW_S,
+    SYSCLK_FREQ_HZ,
+};
 use crate::driver::analog::AnalogSample;
+use crate::foc::feedback::WindowSpeed;
 use crate::foc::safety::Freshness;
 use crate::foc::timing::CycleStats;
 
@@ -15,6 +19,7 @@ static ENC_VALID: AtomicBool = AtomicBool::new(false);
 static ENC_MDEG: AtomicI32 = AtomicI32::new(0);
 static ENC_THETA_BITS: AtomicU32 = AtomicU32::new(0);
 static ENC_OMEGA_MRAD: AtomicI32 = AtomicI32::new(0);
+static ENC_SAMPLED_US: AtomicU32 = AtomicU32::new(0);
 static ENC_AGE: Mutex<Cell<Freshness>> = Mutex::new(Cell::new(Freshness::new()));
 static BUS_AGE: Mutex<Cell<Freshness>> = Mutex::new(Cell::new(Freshness::new()));
 
@@ -27,20 +32,30 @@ fn sample_fresh(age: &Mutex<Cell<Freshness>>, timeout_ms: u32) -> bool {
         fresh
     })
 }
-static RPM_RAW_INIT: AtomicBool = AtomicBool::new(false);
-static RPM_LAST_RAW: AtomicU16 = AtomicU16::new(0);
-static RPM_ACC_COUNTS: AtomicI32 = AtomicI32::new(0);
-static RPM_WIN_US: AtomicU32 = AtomicU32::new(0);
-static RPM_F_BITS: AtomicU32 = AtomicU32::new(0.0f32.to_bits());
-static RPM_READY: AtomicBool = AtomicBool::new(false);
+static SPEED: Mutex<RefCell<WindowSpeed>> = Mutex::new(RefCell::new(WindowSpeed::new(
+    (SPEED_RPM_WINDOW_S * 1_000_000.0) as u32,
+    ENC_SPEED_MAX_GAP_US,
+)));
 
 pub fn publish_angle(raw: u16, theta_m: f32, omega_m: f32, valid: bool) {
-    let valid = valid && theta_m.is_finite() && omega_m.is_finite();
+    publish_angle_at(raw, theta_m, omega_m, valid, Instant::now().as_micros());
+}
+
+/// Keep acquisition time through I2C completion/publication. A slow transaction
+/// cannot turn a stale sample into fresh control feedback.
+pub fn publish_angle_at(raw: u16, theta_m: f32, omega_m: f32, valid: bool, sampled_at_us: u64) {
+    let now_us = Instant::now().as_micros();
+    let valid = valid
+        && theta_m.is_finite()
+        && omega_m.is_finite()
+        && sampled_at_us <= now_us
+        && now_us - sampled_at_us < u64::from(ENC_FAULT_MS) * 1000;
     cortex_m::interrupt::free(|cs| {
         ENC_VALID.store(valid, Ordering::Relaxed);
         if !valid {
             // Fail closed: do not keep applying the previous voltage on I2C errors.
             ENC_AGE.borrow(cs).set(Freshness::new());
+            SPEED.borrow(cs).borrow_mut().reset();
             return;
         }
         ENC_RAW.store(raw & 0x0fff, Ordering::Relaxed);
@@ -50,9 +65,14 @@ pub fn publish_angle(raw: u16, theta_m: f32, omega_m: f32, valid: bool) {
             Ordering::Relaxed,
         );
         ENC_OMEGA_MRAD.store((omega_m * 1000.0) as i32, Ordering::Relaxed);
+        ENC_SAMPLED_US.store(sampled_at_us as u32, Ordering::Relaxed);
         let mut age = Freshness::new();
-        age.refresh(Instant::now().as_millis() as u32);
+        age.refresh((sampled_at_us / 1000) as u32);
         ENC_AGE.borrow(cs).set(age);
+        SPEED
+            .borrow(cs)
+            .borrow_mut()
+            .push(raw, sampled_at_us as u32);
     });
 }
 
@@ -80,10 +100,7 @@ pub fn theta_m_predict(_dt: f32) -> (f32, bool) {
 
 /// Electrical speed for Dq feed-forward from the windowed RPM, not raw ω.
 pub fn omega_e_ff(pole_pairs: u8) -> f32 {
-    let rpm = f32::from_bits(RPM_F_BITS.load(Ordering::Relaxed));
-    if !rpm.is_finite() {
-        return 0.0;
-    }
+    let rpm = cortex_m::interrupt::free(|cs| SPEED.borrow(cs).borrow().rpm()).unwrap_or(0.0);
     rpm * (core::f32::consts::TAU / 60.0) * f32::from(pole_pairs)
 }
 
@@ -103,6 +120,15 @@ pub fn enc_mdeg() -> i32 {
 
 pub fn enc_omega_mrad() -> i32 {
     ENC_OMEGA_MRAD.load(Ordering::Relaxed)
+}
+
+/// Conservative sample age for diagnostics; no extrapolation is enabled.
+pub fn enc_age_us() -> Option<u32> {
+    cortex_m::interrupt::free(|_| {
+        enc_valid().then(|| {
+            (Instant::now().as_micros() as u32).wrapping_sub(ENC_SAMPLED_US.load(Ordering::Relaxed))
+        })
+    })
 }
 
 static IU_MA: AtomicI16 = AtomicI16::new(0);
@@ -298,58 +324,13 @@ pub fn iw_raw() -> u16 {
 
 /// Mechanical RPM from net Δθ over [`crate::bsp::config::SPEED_RPM_WINDOW_S`].
 pub fn rpm_meas() -> i32 {
-    f32::from_bits(RPM_F_BITS.load(Ordering::Relaxed)) as i32
+    cortex_m::interrupt::free(|cs| SPEED.borrow(cs).borrow().rpm().unwrap_or(0.0) as i32)
 }
 
 pub fn rpm_ready() -> bool {
-    RPM_READY.load(Ordering::Relaxed)
+    cortex_m::interrupt::free(|cs| SPEED.borrow(cs).borrow().rpm().is_some() && enc_valid())
 }
 
 pub fn reset_speed_filter() {
-    cortex_m::interrupt::free(|_| {
-        RPM_RAW_INIT.store(false, Ordering::Relaxed);
-        RPM_ACC_COUNTS.store(0, Ordering::Relaxed);
-        RPM_WIN_US.store(0, Ordering::Relaxed);
-        RPM_F_BITS.store(0.0f32.to_bits(), Ordering::Relaxed);
-        RPM_READY.store(false, Ordering::Relaxed);
-    });
-}
-
-/// 12-bit wrap-aware Δraw over [`crate::bsp::config::SPEED_RPM_WINDOW_S`].
-/// Unwrapped `θ` can accumulate encoder chatter into a fake high rpm.
-pub fn push_speed_from_raw(raw: u16, dt: f32) {
-    // A fault ISR may reset this filter; never publish half of a pre-reset update.
-    cortex_m::interrupt::free(|_| push_speed_inner(raw, dt));
-}
-
-fn push_speed_inner(raw: u16, dt: f32) {
-    use crate::bsp::config::SPEED_RPM_WINDOW_S;
-    let raw = raw & 0x0FFF;
-    let dt = dt.max(1e-5);
-    if !RPM_RAW_INIT.swap(true, Ordering::Relaxed) {
-        RPM_LAST_RAW.store(raw, Ordering::Relaxed);
-        RPM_ACC_COUNTS.store(0, Ordering::Relaxed);
-        RPM_WIN_US.store(0, Ordering::Relaxed);
-        return;
-    }
-    let prev = RPM_LAST_RAW.swap(raw, Ordering::Relaxed);
-    let d = crate::foc::angle::raw_delta(raw, prev);
-    RPM_ACC_COUNTS.fetch_add(d, Ordering::Relaxed);
-    let us = (dt * 1_000_000.0) as u32;
-    let acc = RPM_WIN_US.fetch_add(us, Ordering::Relaxed) + us;
-    let win_us = (SPEED_RPM_WINDOW_S * 1_000_000.0) as u32;
-    if acc < win_us {
-        return;
-    }
-    RPM_WIN_US.store(0, Ordering::Relaxed);
-    let counts = RPM_ACC_COUNTS.swap(0, Ordering::Relaxed);
-    let t = acc as f32 / 1_000_000.0;
-    if t < 1e-3 {
-        return;
-    }
-    let rpm = counts as f32 / 4096.0 / t * 60.0;
-    if rpm.is_finite() {
-        RPM_F_BITS.store(rpm.to_bits(), Ordering::Relaxed);
-        RPM_READY.store(true, Ordering::Relaxed);
-    }
+    cortex_m::interrupt::free(|cs| SPEED.borrow(cs).borrow_mut().reset());
 }

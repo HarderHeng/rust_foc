@@ -86,6 +86,17 @@ pub const AS5600_I2C_HZ: u32 = 400_000;
 pub const AS5600_PERIOD_US: u32 = 400;
 /// Closed-loop modes: maximum age of a valid angle. Explicit I2C/magnet errors trip immediately.
 pub const ENC_FAULT_MS: u32 = 20;
+/// Half a turn at MOTOR_MAX_RPM is ambiguous for a 12-bit absolute encoder.
+/// Discard speed readiness before reaching that gap; the 10 ms cap also bounds
+/// recovery when a different, slower motor is configured.
+pub const ENC_SPEED_MAX_GAP_US: u32 = {
+    let half_turn_us = 30_000_000 / MOTOR_MAX_RPM as u32;
+    if half_turn_us < 10_000 {
+        half_turn_us
+    } else {
+        10_000
+    }
+};
 /// Maximum age of a complete VBUS/NTC pair (normally refreshed every ~2 ms).
 pub const BUS_FAULT_MS: u32 = 20;
 /// Supervisor must observe current-control completion within this interval.

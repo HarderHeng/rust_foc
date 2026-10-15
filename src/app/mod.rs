@@ -1,4 +1,5 @@
 pub mod control;
+pub(crate) mod controller;
 pub mod foc_isr;
 pub mod shell;
 pub mod speed;

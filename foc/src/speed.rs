@@ -42,6 +42,17 @@ impl<R: Regulator> SpeedLoop<R> {
         iq_limit: f32,
         iq_applied: f32,
     ) -> f32 {
+        // Validate before updating limits/tracking; a bad speed sample must not
+        // change the integrator that will be reused by the next valid sample.
+        if !rpm_ref.is_finite()
+            || !rpm_meas.is_finite()
+            || !dt.is_finite()
+            || dt < 0.0
+            || !iq_limit.is_finite()
+            || !iq_applied.is_finite()
+        {
+            return f32::NAN;
+        }
         let limit = iq_limit.max(0.0);
         let (lo, hi) = if rpm_ref > 0.0 {
             (0.0, limit)

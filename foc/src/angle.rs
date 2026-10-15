@@ -63,7 +63,12 @@ impl AngleTrack {
         self.last_raw = Some(raw);
 
         let theta = raw as f32 * (TWO_PI / COUNTS as f32);
-        if had && dt.is_finite() && dt > 0.0 {
+        if !self.alpha.is_finite() || !self.omega_window.is_finite() {
+            // Invalid filter tuning must not poison the retained velocity.
+            // Drop its partial window so valid tuning can recover immediately.
+            self.omega_acc_counts = 0;
+            self.omega_acc_dt = 0.0;
+        } else if had && dt.is_finite() && dt > 0.0 {
             self.omega_acc_counts += i64::from(delta);
             self.omega_acc_dt += dt;
             let win = self.omega_window.max(1e-4);

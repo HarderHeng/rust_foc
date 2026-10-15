@@ -9,6 +9,12 @@
   Injected current conversions retain priority. Regular sampling does not toggle ADEN,
   rewrite injected sample times, or re-arm JSQR each poll.
 - ADC ISR status is cleared with W1C writes, preserving regular EOS/EOC flags.
+  Current decoding requires both ADC1 and ADC2 JEOS with neither JQOVF set.
+  ADC1 completion allows ADC2 bounded skew: a 76-cycle deadline and a hard 32-poll
+  cap, whichever stops the wait first (plus the final poll's execution time).
+  A missing partner or queue overflow trips
+  `fault=adc` without publishing a control completion. The poll bound also applies
+  when DWT is stopped. The actual ADC skew remains a board acceptance item.
 - ADC ownership is protected by a short `Mutex<RefCell<Option<Analog>>>` borrow.
   Offset calibration removes the object from the shared slot, disables JEOS, stops both
   conversion groups, and performs blocking calibration with interrupts enabled and PWM
@@ -19,6 +25,10 @@
   require a valid encoder. Explicit I2C/magnet errors trip immediately; silent encoder
   publication expires after `ENC_FAULT_MS` (20 ms). The current ISR independently
   checks freshness using wall time, not encoder-task progress.
+  Encoder age starts immediately before the ANGLE I2C transaction, so completion
+  cannot renew an old acquisition. Future/expired/nonfinite samples are rejected;
+  `enc` exposes this conservative age as `age_us`. This does not measure AS5600
+  internal filter latency. The control angle remains zero-order hold.
 - Start validation, safe CCR preparation, MOE enable and mode commit form one short
   interrupt-masked transaction. Pending hardware break flags are not cleared by start.
   Mode changes while live require `foc stop`; repeated Run start is a keepalive and
@@ -48,7 +58,7 @@
   Neither interrupt progress alone nor an Idle maintenance operation bypasses this
   policy. Encoder error paths count as task liveness while the sensor interlocks still
   disable closed-loop outputs. Runtime offset calibration (48 blocking ADC reads)
-  and a flash save (one page erase and two doubleword writes) must fit the timeout
+  and a flash save (two doubleword writes, plus page erase on reclaim) must fit the timeout
   allowance; their worst-case duration has not yet been established on the board.
 - Panic and HardFault disable TIM1 MOE and CH1-3/CH1N-3, without logging or shared
   borrows, then halt with interrupts disabled. PWM access uses a checked
@@ -62,6 +72,12 @@
   position rather than an ever-growing floating-point angle.
 - Speed PI includes direction limits and tracking of the slew-limited Iq reference.
   No startup torque is injected before the RPM filter is ready, including at zero RPM.
+  RPM uses signed count differences and integer acquisition-time intervals. Encoder
+  errors or gaps at least `ENC_SPEED_MAX_GAP_US` invalidate speed readiness and rebase
+  the window. This gap is capped at 10 ms and at the half-turn interval at maximum
+  configured RPM; a fresh complete 100 ms window is then required. Duplicate stamps
+  do not consume displacement. Sampling aliasing above the configured maximum speed
+  cannot be ruled out by this absolute-encoder estimator.
 - Id/Iq/RPM slew limiters retain fixed-point fractional position. Rates have a resolution
   of 0.001 output units/s; published integer references are rounded within 0.5 unit.
   Stop/fault/start reset fractional state; repeated setpoint updates do not. The
@@ -87,6 +103,26 @@
   a pending old JDR and an in-flight old single-rank conversion. These skips are not
   used to conceal runtime deadline failures. Near 100%, Bench common duty can be
   shifted down as well; use CCR readback to see the applied duty.
+- Current/speed controller state is transferred out of its shared slot under a short
+  critical section. PI, transforms and PWM geometry execute with interrupts enabled;
+  reentrant computation cannot borrow the checked-out state. Reset and gain requests
+  enter a mailbox and invalidate the pending result. Run epochs reject results from
+  a stopped/faulted/restarted run, including a restart into the same mode. Commit
+  rechecks sensor freshness and the PWM path checks hardware MOE before applying.
+  This establishes ownership and interrupt ordering, not a measured WCET improvement.
+- Nonfinite phase-current samples trip `fault=adc` in closed and open loop. Invalid
+  PID input, limits or overflowing arithmetic return an invalid output without
+  corrupting retained history; the driver rejects nonfinite duties. Runtime gain
+  updates reject an entire pair if either value is nonfinite or negative. Shell
+  parsing accepts finite scientific notation and long decimal fractions.
+- NVM keeps the existing 16-byte version-2 format in an append journal of 128 slots
+  within the reserved 2 KiB page. Identical saves are no-ops; invalid/torn slots are
+  consumed rather than overwritten, and later appends leave earlier valid records
+  available. Reclaim occurs only when full, verifies erased bytes, then programs
+  and reads back the replacement. PWM must be off. This single-page design can lose
+  calibration if power fails after reclaim erase, leaving Run/Speed interlocked on
+  next boot until recalibration. Host byte-failure tests do not establish actual
+  STM32 flash ECC or brownout recovery behavior.
 
 ## IRQ timing diagnostics
 
@@ -141,8 +177,26 @@ counter saturation, and rotation equations.
 Sampling tests independently exhaust small timer geometries and sweep the SVPWM
 circle; watchdog tests exercise worker stalls and maintenance recovery. The UART
 completion/formatting helpers are also compiled and tested from their production
-module. The current baseline is 83 passing tests. CI pins Rust 1.98.1 and flip-link
-0.1.12 and runs the full script including release linking.
+module. `firmware_concurrency.rs` imports the production controller/current/speed
+modules and injects faults, stop/restart, reset/gain updates, sensor expiry and
+hardware MOE loss during computation. It asserts that calculation and planning
+execute outside the mocked critical section. `telemetry_feedback.rs` imports the
+production telemetry module to check acquisition age, errors and timestamp wrap.
+
+Independent f64 average-inverter/RL/PMSM models reconstruct applied voltage from
+actual SVPWM duties, include a full-period command delay, and check current steps,
+rotation, feed-forward and saturation recovery. They omit shunt timing, encoder
+latency, dead time and physical noise. The synthetic mechanical model demonstrates
+load sensitivity: unchanged 10 Hz/100 ms speed control oscillates with observed
+tail instantaneous error of about 20 RPM at inertia 5e-5 kg m². Peak-to-peak amplitude
+and period were not measured. Larger modeled inertias meet a 3 RPM tail-error bound; the light
+case only asserts a 50 RPM bound, not precise settling. See `docs/next-steps.md`.
+
+The 2026-10-15 baseline is 113 passing Rust tests plus 13 Python artifact-validation tests.
+CI pins Rust 1.98.1 and flip-link 0.1.12 and runs the full script including release
+linking. The artifact validator checks FLASH/RAM/NVM placement, vector/entry and
+flip-link stack placement, and writes ELF/tool/input hashes and size budgets to
+`manifest.json`. These link-time budgets do not prove runtime stack peaks.
 These tests do **not** validate ADC/TIM1 electrical timing or real IRQ latency.
 
 ## Board acceptance required before loaded operation
@@ -180,13 +234,22 @@ core with SWD while PWM is enabled. Do not treat a successful host test as board
     Check that common-mode adjustment preserves line voltages and that delayed
     commits trip `fault=adc`. Verify startup ignores the two old results and remains
     at safe prepared duty until new feedback is accepted.
+    Suppress one ADC's injected completion and separately force queue overflow in a
+    dedicated build; ensure a stale JDR is never decoded and `fault=adc` is latched.
 11. **IWDG:** in dedicated test builds with outputs initially off, stall the executor
     while ADC interrupts continue, stop the ADC IRQ while tasks continue, and halt
     all CPU work. Measure reset delay and all six gate outputs through reset/reboot.
     Verify reboot stays in Idle. Repeatedly run Idle calibration and flash save at
     supply/temperature limits; confirm their duration plus feed interval fits the
     shortest measured watchdog timeout, including LSI variation.
+12. **NVM:** verify existing v2 calibration loads, repeated identical saves avoid
+    programming, changed records append, and full-page reclaim succeeds. Test
+    interrupted writes and reclaim with controlled power loss; record actual ECC/
+    reset behavior and verify absent calibration prevents Run/Speed after reboot.
+13. **Encoder timing and speed:** measure ANGLE acquisition-to-PWM delay and AS5600
+    internal lag across RPM. Record `enc age_us`, window readiness after gaps, and
+    low-inertia oscillation under limited current before choosing PI or filter changes.
 
 Remaining work includes board-level validation of the sampling planner and IWDG,
-end-to-end IRQ timing measurements, and minimizing critical sections after measurement.
+end-to-end IRQ timing/stack measurements, and speed tuning against measured mechanics.
 NVM writes still require PWM off and can stall flash execution.

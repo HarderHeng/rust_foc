@@ -36,23 +36,19 @@ pub async fn heartbeat_task(led: &'static LedHandle) {
 #[embassy_executor::task]
 pub async fn encoder_task(mut enc: As5600) {
     let mut last = Instant::now();
-    let mut last_valid = Instant::now();
     let period = Duration::from_micros(AS5600_PERIOD_US as u64);
     loop {
         let start = Instant::now();
         let dt = start.duration_since(last).as_micros() as f32 / 1_000_000.0;
         last = start;
-        // Δraw spans valid samples, including any failed transactions in between.
-        let valid_dt = start.duration_since(last_valid).as_micros() as f32 / 1_000_000.0;
-        let s = enc.read(valid_dt.max(1e-5)).await;
-        telemetry::publish_angle(s.raw, s.theta_m, s.omega_m, s.valid);
-        if s.valid {
-            telemetry::push_speed_from_raw(s.raw, valid_dt.max(1e-5));
-            last_valid = start;
-        } else if matches!(
-            control::mode(),
-            control::Mode::Align | control::Mode::Run | control::Mode::Speed
-        ) {
+        let s = enc.read().await;
+        telemetry::publish_angle_at(s.raw, s.theta_m, s.omega_m, s.valid, s.sampled_at_us);
+        if !s.valid
+            && matches!(
+                control::mode(),
+                control::Mode::Align | control::Mode::Run | control::Mode::Speed
+            )
+        {
             control::fault(control::FaultKind::Encoder);
         }
         let _ = speed::tick(s.omega_m, s.valid, dt.max(1e-5));

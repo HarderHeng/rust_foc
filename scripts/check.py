@@ -28,22 +28,28 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout", type=int, default=120, help="seconds per command (default: 120)")
     parser.add_argument("--offline", action="store_true", help="require cached Cargo dependencies")
-    parser.add_argument("--build", action="store_true", help="also link release firmware (requires flip-link)")
+    parser.add_argument("--build", action="store_true", help="also link and validate release firmware, writing a build manifest (requires flip-link)")
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
     root = Path(__file__).resolve().parent.parent
+    target = "thumbv7em-none-eabihf"
     common = ["--locked"] + (["--offline"] if args.offline else [])
     checks = [
+        [sys.executable, "-B", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_*.py"],
         ["cargo", "fmt", "--all", "--", "--check"],
         ["cargo", "htest", *common],
-        ["cargo", "check", "--lib", "--bins", "--release", *common],
-        ["cargo", "clippy", "--lib", "--bins", "--release", *common, "--", "-D", "warnings"],
+        ["cargo", "check", "--lib", "--bins", "--release", "--target", target, *common],
+        ["cargo", "clippy", "--lib", "--bins", "--release", "--target", target, *common, "--", "-D", "warnings"],
         ["cargo", "clippy", "-p", "foc", "--target", "x86_64-unknown-linux-gnu",
          "--all-targets", *common, "--", "-D", "warnings"],
     ]
     if args.build:
-        checks.append(["cargo", "build", "--release", *common])
+        target_dir = Path(os.environ.get("CARGO_TARGET_DIR", str(root / "target")))
+        artifact_dir = target_dir / target / "release"
+        checks.append(["cargo", "build", "--bin", "main", "--release", "--target", target, *common])
+        checks.append([sys.executable, "scripts/artifact.py", "--elf", str(artifact_dir / "main"),
+                       "--output", str(artifact_dir / "manifest.json")])
     for command in checks:
         status = run(command, root, args.timeout)
         if status:

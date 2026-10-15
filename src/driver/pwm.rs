@@ -24,6 +24,23 @@ use crate::foc::Duties;
 
 static PWM: Mutex<RefCell<Option<MotorPwm>>> = Mutex::new(RefCell::new(None));
 
+/// Plan without borrowing the output driver or masking interrupts. Center-aligned
+/// TIM1 uses ARR as the HAL's full-scale compare value.
+pub fn plan_duties(d: Duties) -> Option<SamplePlan> {
+    if !d.a.is_finite() || !d.b.is_finite() || !d.c.is_finite() {
+        return None;
+    }
+    let arr = u32::from(TIM1_PAC.arr().read().arr());
+    let d = d.clamp01();
+    let ccr = |x: f32| (x * arr as f32) as u32;
+    plan_sampling(
+        [ccr(d.a), ccr(d.b), ccr(d.c)],
+        arr,
+        tw_after_ticks(),
+        tw_before_ticks(),
+    )
+}
+
 fn pwm_pin_cfg() -> PwmPinConfig {
     PwmPinConfig {
         output_type: OutputType::PushPull,
@@ -205,18 +222,7 @@ impl MotorPwm {
     /// Use the actual timer ARR and the same integer quantization as CCR writes.
     /// Invalid voltages must never turn into an arbitrary duty through float casts.
     pub fn plan(&self, d: Duties) -> Option<SamplePlan> {
-        if !d.a.is_finite() || !d.b.is_finite() || !d.c.is_finite() {
-            return None;
-        }
-        let d = d.clamp01();
-        let arr = u32::from(TIM1_PAC.arr().read().arr());
-        let ccr = |x: f32| (x * self.max_duty as f32) as u32;
-        plan_sampling(
-            [ccr(d.a), ccr(d.b), ccr(d.c)],
-            arr,
-            tw_after_ticks(),
-            tw_before_ticks(),
-        )
+        plan_duties(d)
     }
 
     /// Commit all preloads and ADC routing from one plan. UDIS prevents a timer

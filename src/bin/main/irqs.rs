@@ -20,12 +20,38 @@ impl Handler<interrupt::typelevel::ADC1_2> for AdcJeos {
     unsafe fn on_interrupt() {
         let start = cortex_m::peripheral::DWT::cycle_count();
         if ADC1.isr().read().jeos() {
+            // Separate ADCs need two completed conversions. Never decode an old
+            // ADC2 JDR merely because ADC1 completed. Allow bounded clock skew;
+            // a missing partner cannot block the handler indefinitely.
+            let partner_start = cortex_m::peripheral::DWT::cycle_count();
+            let mut partner_polls = 0;
+            while !ADC2.isr().read().jeos()
+                && partner_polls < 32
+                && cortex_m::peripheral::DWT::cycle_count().wrapping_sub(partner_start)
+                    < stm32g431_foc::bsp::config::tw_before_ticks()
+            {
+                // Keep the bound even if the diagnostic cycle counter stops.
+                partner_polls += 1;
+            }
+            let adc1 = ADC1.isr().read();
+            let adc2 = ADC2.isr().read();
+            let paired = adc2.jeos() && !adc1.jqovf() && !adc2.jqovf();
             // W1C: preserve regular EOS/EOC for the nonblocking bus sampler.
-            ADC1.isr().write(|r| r.set_jeos(true));
-            ADC2.isr().write(|r| r.set_jeos(true));
-            if let Some(s) = analog::with_analog(|a| a.read_currents()).flatten() {
-                foc_isr::on_injected(s);
-                telemetry::publish_control_completion();
+            ADC1.isr().write(|r| {
+                r.set_jeos(true);
+                r.set_jqovf(true);
+            });
+            ADC2.isr().write(|r| {
+                r.set_jeos(true);
+                r.set_jqovf(true);
+            });
+            if paired {
+                if let Some(s) = analog::with_analog(|a| a.read_currents()).flatten() {
+                    foc_isr::on_injected(s);
+                    telemetry::publish_control_completion();
+                }
+            } else {
+                control::fault(control::FaultKind::Adc);
             }
             // Also records early-return fault/idle paths and unavailable samples.
             let end = cortex_m::peripheral::DWT::cycle_count();

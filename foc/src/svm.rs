@@ -6,7 +6,15 @@ use super::types::{AlphaBeta, Duties, PhaseAbc};
 
 /// Map `v_alpha/v_beta` (volts) to three phase duties in 0..1.
 pub fn svpwm(ab: AlphaBeta, vbus: f32) -> Duties {
-    let vbus = vbus.max(1.0);
+    // Preserve invalidity for the driver's duty validator; do not silently turn
+    // a missing bus reading into a 1 V inverter model.
+    if !vbus.is_finite() || vbus <= 0.0 {
+        return Duties {
+            a: f32::NAN,
+            b: f32::NAN,
+            c: f32::NAN,
+        };
+    }
     let p = inv_clarke(ab);
     let vmax = p.a.max(p.b).max(p.c);
     let vmin = p.a.min(p.b).min(p.c);
@@ -21,7 +29,11 @@ pub fn svpwm(ab: AlphaBeta, vbus: f32) -> Duties {
 
 /// SVPWM inscribed-circle voltage limit (volts).
 pub fn max_modulation(vbus: f32) -> f32 {
-    vbus * 0.577_350_26
+    if vbus.is_finite() && vbus > 0.0 {
+        vbus * 0.577_350_26
+    } else {
+        f32::NAN
+    }
 }
 
 /// Shift each duty by `±shift` according to phase-current sign (inverter convention).
@@ -55,10 +67,21 @@ pub struct CircleLimit;
 
 impl VoltageLimiter for CircleLimit {
     fn limit(&self, vd: f32, vq: f32, vmax: f32) -> (f32, f32) {
-        let mag = libm::sqrtf(vd * vd + vq * vq);
-        if mag > vmax && mag > 1e-6 {
-            let s = vmax / mag;
-            (vd * s, vq * s)
+        if !vd.is_finite() || !vq.is_finite() || !vmax.is_finite() {
+            return (f32::NAN, f32::NAN);
+        }
+        let vmax = vmax.max(0.0);
+        let largest = vd.abs().max(vq.abs());
+        if largest == 0.0 {
+            return (vd, vq);
+        }
+        // Normalize before squaring: finite references can otherwise overflow
+        // the norm, or underflow so a tiny nonzero vector escapes a zero limit.
+        let d = vd / largest;
+        let q = vq / largest;
+        let radius = vmax / libm::sqrtf(d * d + q * q);
+        if largest > radius {
+            (d * radius, q * radius)
         } else {
             (vd, vq)
         }
@@ -71,9 +94,19 @@ pub struct VdPriority;
 
 impl VoltageLimiter for VdPriority {
     fn limit(&self, vd: f32, vq: f32, vmax: f32) -> (f32, f32) {
+        if !vd.is_finite() || !vq.is_finite() || !vmax.is_finite() {
+            return (f32::NAN, f32::NAN);
+        }
         let vmax = vmax.max(0.0);
         let vd = vd.clamp(-vmax, vmax);
-        let qmax = libm::sqrtf((vmax * vmax - vd * vd).max(0.0));
+        let qmax = if vmax > 0.0 && !(1e-19..=1e19).contains(&vmax) {
+            // Rare extreme-range path; retain the simple ISR arithmetic for
+            // physical bus voltages while avoiding inf-inf and tiny squares.
+            let d = vd / vmax;
+            vmax * libm::sqrtf((1.0 - d * d).max(0.0))
+        } else {
+            libm::sqrtf((vmax * vmax - vd * vd).max(0.0))
+        };
         (vd, vq.clamp(-qmax, qmax))
     }
 }

@@ -1,115 +1,128 @@
-//! Last 2 KiB flash page: electrical offset and pole pairs (G431 page = 2 KiB).
+//! Last 2 KiB flash page: append-only calibration journal (128 records).
 //!
-//! Erase stalls the CPU. Save only with PWM off (Idle). Never call from the current ISR.
+//! Save only with PWM off (Idle), never from an ISR. Identical saves are no-ops;
+//! full-page reclaim can lose calibration if power fails after erase.
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::cell::RefCell;
 
+use cortex_m::interrupt::Mutex;
 use embassy_stm32::flash::{Blocking, Flash};
 use embassy_stm32::interrupt::InterruptExt;
 use embassy_stm32::peripherals::FLASH;
 use embassy_stm32::Peri;
-use static_cell::StaticCell;
+
+pub use ::foc::nvm::Record;
+use ::foc::nvm::{self, SaveOutcome, Storage, PAGE_SIZE, SLOT_SIZE};
 
 /// Offset from `0x0800_0000`. Last page of 128 KiB.
 pub const PAGE_OFF: u32 = 0x1_F800;
-pub const PAGE_END: u32 = 0x2_0000;
+pub const PAGE_END: u32 = PAGE_OFF + PAGE_SIZE as u32;
 const ABS: u32 = 0x0800_0000 + PAGE_OFF;
 
-const MAGIC: u32 = 0x3143_4F46; // "FOC1"
-                                // Version 1 may contain offsets from unqualified automatic alignments.
-                                // Fail closed on upgrade: re-align (or explicitly set a verified offset) and save.
-const VERSION: u16 = 2;
-const SLOT: usize = 16;
-
-#[derive(Clone, Copy, Debug)]
-pub struct Record {
-    pub theta_e_off_mrad: i32,
-    pub poles: u8,
-}
-
-static SLOT_FLASH: StaticCell<Flash<'static, Blocking>> = StaticCell::new();
-static FLASH_PTR: AtomicPtr<Flash<'static, Blocking>> = AtomicPtr::new(core::ptr::null_mut());
+static FLASH_SLOT: Mutex<RefCell<Option<Flash<'static, Blocking>>>> =
+    Mutex::new(RefCell::new(None));
 
 pub fn init(flash: Peri<'static, FLASH>) {
-    let f = SLOT_FLASH.init(Flash::new_blocking(flash));
-    FLASH_PTR.store(f as *mut _, Ordering::Release);
+    cortex_m::interrupt::free(|cs| {
+        let mut slot = FLASH_SLOT.borrow(cs).borrow_mut();
+        assert!(slot.is_none(), "NVM already initialized");
+        *slot = Some(Flash::new_blocking(flash));
+    });
 }
 
-fn with_flash<R>(f: impl FnOnce(&mut Flash<'static, Blocking>) -> R) -> Option<R> {
-    // Erase takes tens of ms. Do not mask all IRQs — that deadlocks embassy
-    // flash waits and kills USART. Mask only ADC JEOS so the current ISR
-    // cannot run mid-erase (TIM1 may still be counting).
-    embassy_stm32::interrupt::ADC1_2.disable();
-    let p = FLASH_PTR.load(Ordering::Acquire);
-    let out = if p.is_null() {
-        None
-    } else {
-        Some(f(unsafe { &mut *p }))
-    };
-    unsafe {
-        embassy_stm32::interrupt::ADC1_2.enable();
+/// Own the peripheral outside a critical section; reentrant callers get None.
+struct FlashLease(Option<Flash<'static, Blocking>>);
+
+impl FlashLease {
+    fn take() -> Option<Self> {
+        cortex_m::interrupt::free(|cs| {
+            FLASH_SLOT
+                .borrow(cs)
+                .borrow_mut()
+                .take()
+                .map(|flash| Self(Some(flash)))
+        })
     }
-    out
 }
 
-fn checksum(body: &[u8; 12]) -> u32 {
-    let mut c = 0xA5A5_5A5A;
-    for chunk in body.chunks(4) {
-        let mut w = [0u8; 4];
-        w[..chunk.len()].copy_from_slice(chunk);
-        c ^= u32::from_le_bytes(w);
-        c = c.rotate_left(5).wrapping_add(0x9E37_79B9);
+impl Drop for FlashLease {
+    fn drop(&mut self) {
+        cortex_m::interrupt::free(|cs| {
+            *FLASH_SLOT.borrow(cs).borrow_mut() = self.0.take();
+        });
     }
-    c
 }
 
-fn pack(r: Record) -> [u8; SLOT] {
-    let mut body = [0u8; 12];
-    body[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-    body[4..6].copy_from_slice(&VERSION.to_le_bytes());
-    body[6] = r.poles.max(1);
-    body[7] = 0;
-    body[8..12].copy_from_slice(&r.theta_e_off_mrad.to_le_bytes());
-    let mut out = [0u8; SLOT];
-    out[..12].copy_from_slice(&body);
-    out[12..16].copy_from_slice(&checksum(&body).to_le_bytes());
-    out
-}
+/// Avoid the current ISR during flash writes without masking executor IRQs.
+struct AdcIrqGuard(bool);
 
-fn unpack(raw: &[u8; SLOT]) -> Option<Record> {
-    let mut body = [0u8; 12];
-    body.copy_from_slice(&raw[..12]);
-    let magic = u32::from_le_bytes(body[0..4].try_into().ok()?);
-    let ver = u16::from_le_bytes(body[4..6].try_into().ok()?);
-    let crc = u32::from_le_bytes(raw[12..16].try_into().ok()?);
-    if magic != MAGIC || ver != VERSION || crc != checksum(&body) {
-        return None;
+impl AdcIrqGuard {
+    fn new() -> Self {
+        let irq = embassy_stm32::interrupt::ADC1_2;
+        let was_enabled = irq.is_enabled();
+        irq.disable();
+        Self(was_enabled)
     }
-    Some(Record {
-        poles: body[6].max(1),
-        theta_e_off_mrad: i32::from_le_bytes(body[8..12].try_into().ok()?),
-    })
 }
 
-/// Read the mapped page. No FLASH unlock.
+impl Drop for AdcIrqGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { embassy_stm32::interrupt::ADC1_2.enable() };
+        }
+    }
+}
+
+impl Storage for FlashLease {
+    fn read_slot(&mut self, index: usize) -> [u8; SLOT_SIZE] {
+        assert!(index < nvm::SLOT_COUNT);
+        let mut raw = [0; SLOT_SIZE];
+        for (offset, byte) in raw.iter_mut().enumerate() {
+            // Volatile reads ensure readback observes programmed flash bytes.
+            *byte = unsafe {
+                core::ptr::read_volatile((ABS as usize + index * SLOT_SIZE + offset) as *const u8)
+            };
+        }
+        raw
+    }
+
+    fn erase(&mut self) -> bool {
+        self.0
+            .as_mut()
+            .unwrap()
+            .blocking_erase(PAGE_OFF, PAGE_END)
+            .is_ok()
+    }
+
+    fn write_slot(&mut self, index: usize, raw: &[u8; SLOT_SIZE]) -> bool {
+        assert!(index < nvm::SLOT_COUNT);
+        self.0
+            .as_mut()
+            .unwrap()
+            .blocking_write(PAGE_OFF + (index * SLOT_SIZE) as u32, raw)
+            .is_ok()
+    }
+}
+
+/// No FLASH unlock, and no ADC interrupt masking for read-only status queries.
 pub fn load() -> Option<Record> {
-    let mut raw = [0u8; SLOT];
-    unsafe {
-        core::ptr::copy_nonoverlapping(ABS as *const u8, raw.as_mut_ptr(), SLOT);
-    }
-    unpack(&raw)
+    nvm::load(&mut FlashLease::take()?)
 }
 
-pub fn save(r: Record) -> bool {
-    let bytes = pack(r);
-    let ok = with_flash(|f| {
-        f.blocking_erase(PAGE_OFF, PAGE_END).is_ok() && f.blocking_write(PAGE_OFF, &bytes).is_ok()
-    })
-    .unwrap_or(false);
-    if ok {
-        defmt::info!("nvm saved off={} poles={}", r.theta_e_off_mrad, r.poles);
-    } else {
-        defmt::warn!("nvm save failed");
+pub fn save(record: Record) -> bool {
+    let Some(mut flash) = FlashLease::take() else {
+        return false;
+    };
+    let _adc_irq = AdcIrqGuard::new();
+    let result = nvm::save(&mut flash, record);
+    match result {
+        Ok(SaveOutcome::Unchanged) => defmt::info!("nvm unchanged"),
+        Ok(_) => defmt::info!(
+            "nvm saved off={} poles={}",
+            record.theta_e_off_mrad,
+            record.poles
+        ),
+        Err(_) => defmt::warn!("nvm save failed"),
     }
-    ok
+    result.is_ok()
 }

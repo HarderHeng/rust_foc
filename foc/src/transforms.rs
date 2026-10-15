@@ -11,6 +11,10 @@ pub fn wrap_2pi(theta: f32) -> f32 {
     if x < 0.0 {
         x += TWO_PI;
     }
+    // A tiny negative remainder can round up to TAU during the addition.
+    if x >= TWO_PI {
+        x = 0.0;
+    }
     x
 }
 

@@ -393,6 +393,12 @@ impl Shell {
                 let _ = self.write_i32(app::enc_mdeg()).await;
                 let _ = self.write_all(b" w=").await;
                 let _ = self.write_i32(app::enc_omega_mrad()).await;
+                let _ = self.write_all(b" age_us=").await;
+                if let Some(age) = app::telemetry::enc_age_us() {
+                    let _ = self.write_u32(age).await;
+                } else {
+                    let _ = self.write_all(b"invalid").await;
+                }
                 let _ = self.write_all(b" ").await;
                 let _ = self.write_all(ok.as_bytes()).await;
                 let _ = self.write_all(b"\r\n").await;
@@ -759,20 +765,26 @@ impl Shell {
 
     async fn cmd_gain(&mut self, name: &str, arg: Option<&str>, current: bool, is_kp: bool) {
         if let Some(v) = parse_f32(arg) {
-            if current {
+            let accepted = if current {
                 let (kp, ki) = if is_kp {
                     (v, control::current_ki())
                 } else {
                     (control::current_kp(), v)
                 };
-                control::set_current_gains(kp, ki);
+                control::set_current_gains(kp, ki)
             } else {
                 let (kp, ki) = if is_kp {
                     (v, control::speed_ki())
                 } else {
                     (control::speed_kp(), v)
                 };
-                control::set_speed_gains(kp, ki);
+                control::set_speed_gains(kp, ki)
+            };
+            if !accepted {
+                let _ = self
+                    .write_all(b"gain must be finite and nonnegative\r\n")
+                    .await;
+                return;
             }
         } else if arg.is_some() {
             let _ = self

@@ -1,77 +1,79 @@
 //! Configurable-rate speed PI. Writes `iq` for [`super::control::Mode::Speed`].
 
-use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
-
-use static_cell::StaticCell;
-
 use crate::app::control;
+use crate::app::controller::{Controller, ControllerState};
 use crate::bsp::config::{SPEED_IQ_MAX_A, SPEED_KI, SPEED_KP, SPEED_LOOP_HZ};
 use crate::foc::SpeedLoop;
 
-static SLOT: StaticCell<SpeedLoop> = StaticCell::new();
-static PTR: AtomicPtr<SpeedLoop> = AtomicPtr::new(core::ptr::null_mut());
-static ACC_US: AtomicU32 = AtomicU32::new(0);
+struct SpeedState {
+    loop_: SpeedLoop,
+    acc_us: u32,
+}
+
+impl ControllerState for SpeedState {
+    fn reset(&mut self) {
+        self.loop_.reset();
+        self.acc_us = 0;
+    }
+
+    fn set_gains(&mut self, kp: f32, ki: f32) {
+        self.loop_.set_gains(kp, ki);
+    }
+}
+
+static LOOP: Controller<SpeedState> = Controller::new();
 
 pub fn init() {
-    let s = SLOT.init(SpeedLoop::new(SPEED_KP, SPEED_KI, SPEED_IQ_MAX_A));
-    PTR.store(s as *mut SpeedLoop, Ordering::Release);
+    LOOP.init(SpeedState {
+        loop_: SpeedLoop::new(SPEED_KP, SPEED_KI, SPEED_IQ_MAX_A),
+        acc_us: 0,
+    });
 }
 
 pub fn reset() {
-    ACC_US.store(0, Ordering::Relaxed);
     crate::app::telemetry::reset_speed_filter();
-    with_loop(|l| l.reset());
+    LOOP.reset();
 }
 
 pub fn set_gains(kp: f32, ki: f32) {
-    with_loop(|l| l.set_gains(kp, ki));
+    LOOP.set_gains(kp, ki);
 }
 
 /// `omega_m` mechanical rad/s. Returns whether Iq was updated.
-pub fn tick(omega_m: f32, valid: bool, dt: f32) -> bool {
-    if control::mode() != control::Mode::Speed {
-        return false;
-    }
-    if !valid {
-        return false;
-    }
-    let us = ((dt.max(0.0) * 1_000_000.0) as u32).max(1);
-    let acc = ACC_US.fetch_add(us, Ordering::Relaxed) + us;
-    let period_us = 1_000_000 / SPEED_LOOP_HZ.max(1);
-    if acc < period_us {
-        return false;
-    }
-    ACC_US.store(0, Ordering::Relaxed);
-    let _ = omega_m;
-    if !crate::app::telemetry::rpm_ready() {
-        // Wait for real feedback; even a zero/negative command must not get a positive kick.
-        control::write_iq_ma(0);
-        return true;
-    }
-    let rpm = crate::app::telemetry::rpm_meas() as f32;
-    let tgt = control::rpm_ref() as f32;
-    let Some(iq) = with_loop(|l| {
-        l.step_same_direction(
-            tgt,
-            rpm,
-            acc as f32 / 1_000_000.0,
-            SPEED_IQ_MAX_A,
-            control::iq_a(),
-        )
-    }) else {
+pub fn tick(_omega_m: f32, valid: bool, dt: f32) -> bool {
+    let Some(token) = control::output_token() else {
         return false;
     };
-    control::write_iq_ma((iq * 1000.0) as i32);
-    true
-}
-
-fn with_loop<R>(f: impl FnOnce(&mut SpeedLoop) -> R) -> Option<R> {
-    cortex_m::interrupt::free(|_| {
-        let p = PTR.load(Ordering::Acquire);
-        if p.is_null() {
-            None
-        } else {
-            Some(f(unsafe { &mut *p }))
-        }
-    })
+    if token.mode() != control::Mode::Speed || !valid || !dt.is_finite() || dt <= 0.0 {
+        return false;
+    }
+    let us = ((dt * 1_000_000.0) as u32).max(1);
+    LOOP.compute(
+        |state| {
+            state.acc_us = state.acc_us.saturating_add(us);
+            let period_us = 1_000_000 / SPEED_LOOP_HZ.max(1);
+            if state.acc_us < period_us {
+                return None;
+            }
+            let acc = core::mem::take(&mut state.acc_us);
+            if !crate::app::telemetry::rpm_ready() {
+                // Wait for real feedback, including for a zero/negative command.
+                return Some(0);
+            }
+            let rpm = crate::app::telemetry::rpm_meas() as f32;
+            let tgt = control::rpm_ref() as f32;
+            let iq = state.loop_.step_same_direction(
+                tgt,
+                rpm,
+                acc as f32 / 1_000_000.0,
+                SPEED_IQ_MAX_A,
+                control::iq_a(),
+            );
+            Some((iq * 1000.0) as i32)
+        },
+        |iq| {
+            let Some(iq) = iq else { return false };
+            control::commit_output(token, || control::write_iq_ma(iq)).is_some()
+        },
+    )
 }

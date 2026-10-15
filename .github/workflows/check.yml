@@ -28,9 +28,15 @@ jobs:
         run: cargo install flip-link --version 0.1.12 --locked --target x86_64-unknown-linux-gnu
       - name: Check formatting, host tests, firmware and lint; link release firmware
         run: python3 scripts/check.py --build --timeout 300
+      - name: Summarize firmware artifact
+        run: |
+          echo 'Firmware ELF: `target/thumbv7em-none-eabihf/release/main`' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Build manifest: `target/thumbv7em-none-eabihf/release/manifest.json`' >> "$GITHUB_STEP_SUMMARY"
       - name: Upload release firmware
         uses: actions/upload-artifact@v4
         with:
           name: stm32g431-foc
-          path: target/thumbv7em-none-eabihf/release/main
+          path: |
+            target/thumbv7em-none-eabihf/release/main
+            target/thumbv7em-none-eabihf/release/manifest.json
           if-no-files-found: error

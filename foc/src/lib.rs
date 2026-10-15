@@ -5,6 +5,8 @@
 pub mod alignment;
 pub mod angle;
 pub mod current;
+pub mod feedback;
+pub mod nvm;
 pub mod pid;
 pub mod safety;
 pub mod sampling;

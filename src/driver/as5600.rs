@@ -3,7 +3,7 @@
 use embassy_stm32::i2c::I2c;
 use embassy_stm32::mode::Async;
 use embassy_stm32::time::Hertz;
-use embassy_time::Duration;
+use embassy_time::{Duration, Instant};
 
 use crate::bsp::config::AS5600_I2C_ADDR;
 use crate::foc::AngleTrack;
@@ -28,12 +28,15 @@ pub struct AngleSample {
     pub omega_m: f32,
     pub valid: bool,
     pub status: As5600Status,
+    /// Start of the ANGLE transaction; publication must not make old data fresh.
+    pub sampled_at_us: u64,
 }
 
 pub struct As5600 {
     i2c: I2c<'static, Async, embassy_stm32::i2c::Master>,
     track: AngleTrack,
     last_raw: u16,
+    last_sample_us: Option<u64>,
 }
 
 impl As5600 {
@@ -42,10 +45,11 @@ impl As5600 {
             i2c,
             track: AngleTrack::new(),
             last_raw: 0,
+            last_sample_us: None,
         }
     }
 
-    pub async fn read(&mut self, dt: f32) -> AngleSample {
+    pub async fn read(&mut self) -> AngleSample {
         let mut status_buf = [0u8; 1];
         if self
             .i2c
@@ -65,6 +69,7 @@ impl As5600 {
         // ANGLE is a 16-bit special register: pointer at 0x0E, then 2 bytes (11:8, 7:0).
         // Do not burst from STATUS — after 0x0C the pointer stops incrementing.
         let mut angle_buf = [0u8; 2];
+        let sampled_at_us = Instant::now().as_micros();
         if self
             .i2c
             .write_read(AS5600_I2C_ADDR, &[REG_ANGLE], &mut angle_buf)
@@ -79,6 +84,15 @@ impl As5600 {
 
         let raw = (u16::from(angle_buf[0]) << 8 | u16::from(angle_buf[1])) & 0x0FFF;
         self.last_raw = raw;
+        let dt = self
+            .last_sample_us
+            .map(|previous| sampled_at_us.saturating_sub(previous) as f32 / 1_000_000.0)
+            .unwrap_or(0.0);
+        self.last_sample_us = Some(sampled_at_us);
+        if dt >= crate::bsp::config::ENC_SPEED_MAX_GAP_US as f32 / 1_000_000.0 {
+            // Multiple missed turns cannot be reconstructed from a 12-bit angle.
+            self.track = AngleTrack::new();
+        }
         let (theta_m, omega_m) = self.track.push(raw, dt);
         AngleSample {
             raw,
@@ -86,6 +100,7 @@ impl As5600 {
             omega_m,
             valid: true,
             status,
+            sampled_at_us,
         }
     }
 
@@ -97,6 +112,7 @@ impl As5600 {
             omega_m,
             valid: false,
             status,
+            sampled_at_us: 0,
         }
     }
 }

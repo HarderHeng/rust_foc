@@ -112,6 +112,9 @@ impl FaultKind {
 }
 
 static MODE: AtomicU8 = AtomicU8::new(Mode::Idle as u8);
+// A mode can stop and restart while a preempted controller owns its state.
+// The epoch makes that same-mode restart distinguishable at output commit.
+static OUTPUT_EPOCH: AtomicU32 = AtomicU32::new(0);
 static ID_MA: AtomicI32 = AtomicI32::new(0);
 static IQ_MA: AtomicI32 = AtomicI32::new(0);
 static ID_TGT_MA: AtomicI32 = AtomicI32::new(0);
@@ -193,6 +196,46 @@ pub fn outputs_live() -> bool {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct OutputToken {
+    mode: Mode,
+    epoch: u32,
+}
+
+impl OutputToken {
+    pub(crate) fn mode(self) -> Mode {
+        self.mode
+    }
+}
+
+/// Capture the run identity before computing with controller-owned state.
+pub(crate) fn output_token() -> Option<OutputToken> {
+    cortex_m::interrupt::free(|_| {
+        let mode = mode();
+        matches!(mode, Mode::Align | Mode::Run | Mode::Openloop | Mode::Speed).then(|| {
+            OutputToken {
+                mode,
+                epoch: OUTPUT_EPOCH.load(Ordering::Relaxed),
+            }
+        })
+    })
+}
+
+/// Validate and publish atomically against software stop/trip/restart. The
+/// peripheral commit must also check MOE: hardware break can act without an IRQ.
+pub(crate) fn commit_output<R>(token: OutputToken, commit: impl FnOnce() -> R) -> Option<R> {
+    cortex_m::interrupt::free(|_| {
+        if mode() != token.mode || OUTPUT_EPOCH.load(Ordering::Relaxed) != token.epoch {
+            return None;
+        }
+        if let Some(kind) = sensor_fault(token.mode) {
+            fault(kind);
+            return None;
+        }
+        Some(commit())
+    })
+}
+
 /// Sensor interlocks shared by the start transaction, supervisor and current ISR.
 pub fn sensor_fault(target: Mode) -> Option<FaultKind> {
     use crate::bsp::config::{NTC_T_MAX_C, VBUS_OV_MV, VBUS_UV_MV};
@@ -223,7 +266,6 @@ fn enter_mode(target: Mode, prepare: impl FnOnce()) -> bool {
         prepare();
         cortex_m::interrupt::free(|cs| CURRENT_WATCH.borrow(cs).set(None));
         foc_isr::reset();
-        foc_isr::reset_openloop();
         ID_MA.store(0, Ordering::Relaxed);
         IQ_MA.store(0, Ordering::Relaxed);
         reset_ramps(0, 0, rpm_ref());
@@ -256,6 +298,7 @@ fn enter_mode(target: Mode, prepare: impl FnOnce()) -> bool {
         }
         LAST_FAULT.store(FaultKind::None as u8, Ordering::Relaxed);
         touch_cmd();
+        OUTPUT_EPOCH.fetch_add(1, Ordering::Relaxed);
         MODE.store(target as u8, Ordering::Relaxed);
         true
     })
@@ -345,6 +388,7 @@ fn clear_references() {
 
 pub fn stop() {
     cortex_m::interrupt::free(|_| {
+        OUTPUT_EPOCH.fetch_add(1, Ordering::Relaxed);
         let _ = with_pwm(|p| p.disable());
         speed_loop::reset();
         clear_references();
@@ -354,6 +398,7 @@ pub fn stop() {
 
 pub fn fault(kind: FaultKind) {
     cortex_m::interrupt::free(|_| {
+        OUTPUT_EPOCH.fetch_add(1, Ordering::Relaxed);
         let _ = with_pwm(|p| p.disable());
         if mode() != Mode::Fault {
             // Preserve the first trip cause, not a later consequence of it.
@@ -499,6 +544,7 @@ fn finish_align() {
         let _ = with_pwm(|p| p.disable());
         clear_references();
         foc_isr::reset();
+        OUTPUT_EPOCH.fetch_add(1, Ordering::Relaxed);
         MODE.store(Mode::Idle as u8, Ordering::Relaxed);
         // Flash writes remain explicit and outside any critical section.
     });
@@ -666,7 +712,7 @@ pub fn load_nvm() -> bool {
     }
 }
 
-/// Erase+program the NVM page. Refuses while PWM is live.
+/// Append calibration, reclaiming the page only when full. Refuses outside Idle.
 pub fn persist_nvm() -> bool {
     if mode() != Mode::Idle || !calibration_valid() {
         return false;
@@ -708,16 +754,28 @@ pub fn speed_ki() -> f32 {
     load_f32(&SPD_KI)
 }
 
-pub fn set_current_gains(kp: f32, ki: f32) {
-    store_f32(&CUR_KP, kp.max(0.0));
-    store_f32(&CUR_KI, ki.max(0.0));
-    foc_isr::set_gains(current_kp(), current_ki());
+pub fn set_current_gains(kp: f32, ki: f32) -> bool {
+    if !kp.is_finite() || !ki.is_finite() || kp < 0.0 || ki < 0.0 {
+        return false;
+    }
+    cortex_m::interrupt::free(|_| {
+        store_f32(&CUR_KP, kp);
+        store_f32(&CUR_KI, ki);
+        foc_isr::set_gains(current_kp(), current_ki());
+    });
+    true
 }
 
-pub fn set_speed_gains(kp: f32, ki: f32) {
-    store_f32(&SPD_KP, kp.max(0.0));
-    store_f32(&SPD_KI, ki.max(0.0));
-    speed_loop::set_gains(speed_kp(), speed_ki());
+pub fn set_speed_gains(kp: f32, ki: f32) -> bool {
+    if !kp.is_finite() || !ki.is_finite() || kp < 0.0 || ki < 0.0 {
+        return false;
+    }
+    cortex_m::interrupt::free(|_| {
+        store_f32(&SPD_KP, kp);
+        store_f32(&SPD_KI, ki);
+        speed_loop::set_gains(speed_kp(), speed_ki());
+    });
+    true
 }
 
 fn store_f32(a: &AtomicU32, v: f32) {
