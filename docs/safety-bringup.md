@@ -37,17 +37,28 @@
   retained until a successful restart. `foc stop` acknowledges Fault but does not
   bypass sensor or hardware-break interlocks on the next start.
 - Pole pairs and electrical offset can only be changed in Idle. Run/Speed require valid
-  calibration (`cal=ok`): a qualified alignment, a valid NVM version-2 record, or an
-  explicit operator-entered offset. Changing pole pairs invalidates calibration;
-  setting the same value does not. NVM version 1 records are ignored on upgrade because
-  they may have been written by the earlier unqualified alignment. Uncalibrated state
-  cannot be saved. Openloop and Bench do not require rotor calibration.
+  calibration (`cal=ok`): a qualified alignment, a valid NVM version-3 record, or an
+  explicit operator-entered, independently verified offset (`foc offset <mrad>`).
+  This offset command is an operator override; firmware does not verify the entered
+  value. The command automatically saves it. Changing pole pairs invalidates calibration;
+  setting the same value does not. NVM versions 1 and 2 are ignored on upgrade because
+  earlier firmware could save unverified offsets and the records do not identify
+  their origin. Upgrade requires a qualified `foc align` followed by `foc save`, or
+  an independently verified `foc offset <mrad>`. Uncalibrated state cannot be saved.
+  Openloop and Bench do not require rotor calibration.
+- `foc zero` requires Idle and a fresh encoder sample. It captures the current position
+  as an unverified electrical offset, invalidates calibration, and does not save it.
+  It cannot qualify Run/Speed or `foc save`; use a qualified alignment or explicitly
+  enter an independently verified offset before saving.
 - Alignment is qualified on the supervisor using fresh current-loop completions,
   measured Id within `min(100 mA, target/5)` of target, measured |Iq| within the same
   tolerance, a valid encoder, and rotor motion of at most 8 counts throughout a
   continuous 500 ms hold. A loss of qualification or a poll gap above 5 ms restarts the
   hold. Timeout after 2 s trips `fault=align`, disables PWM, invalidates calibration,
   and keeps the previous offset. The thresholds require unloaded board review.
+  `foc align` without a current uses the default. Invalid text, integer overflow, or
+  extra arguments return `usage` without starting alignment; valid integer currents
+  retain the controller's existing clamp.
 - The supervisor trips `fault=stall` if live outputs observe no current-control
   completion for 5 ms. The completion sequence is separate from `foc isr` diagnostics,
   so a statistics reset cannot pet it.
@@ -115,8 +126,10 @@
   corrupting retained history; the driver rejects nonfinite duties. Runtime gain
   updates reject an entire pair if either value is nonfinite or negative. Shell
   parsing accepts finite scientific notation and long decimal fractions.
-- NVM keeps the existing 16-byte version-2 format in an append journal of 128 slots
-  within the reserved 2 KiB page. Identical saves are no-ops; invalid/torn slots are
+- NVM uses version 3 while keeping the existing 16-byte layout in an append journal
+  of 128 slots within the reserved 2 KiB page. Version-1/version-2 slots are ignored
+  for loading but remain consumed, so new version-3 records can append after them.
+  Identical saves are no-ops; invalid/torn slots are
   consumed rather than overwritten, and later appends leave earlier valid records
   available. Reclaim occurs only when full, verifies erased bytes, then programs
   and reads back the replacement. PWM must be off. This single-page design can lose
@@ -228,6 +241,8 @@ core with SWD while PWM is enabled. Do not treat a successful host test as board
    verify panic and HardFault disable all six outputs within an acceptable time.
 9. **Alignment:** verify success, tolerance, rotor-motion detection and timeout with a
    current-limited unloaded motor; check that a failed alignment keeps the old offset.
+   Confirm `foc zero` invalidates calibration, does not save, and blocks Run/Speed and
+   `foc save`. Check malformed `foc align` commands report usage without enabling PWM.
 10. **Sampling planner:** with controlled PWM test patterns, scope both measured
     low-side windows and the ADC trigger/conversion. Include two equal high duties,
     all phase permutations, the complete modulation sweep and regular ADC activity.
@@ -242,8 +257,10 @@ core with SWD while PWM is enabled. Do not treat a successful host test as board
     Verify reboot stays in Idle. Repeatedly run Idle calibration and flash save at
     supply/temperature limits; confirm their duration plus feed interval fits the
     shortest measured watchdog timeout, including LSI variation.
-12. **NVM:** verify existing v2 calibration loads, repeated identical saves avoid
-    programming, changed records append, and full-page reclaim succeeds. Test
+12. **NVM:** verify v1/v2-only records are rejected and keep Run/Speed interlocked;
+    confirm v3 calibration loads and new v3 records append after consumed old-version
+    slots. Verify repeated identical saves avoid programming, changed records append,
+    and full-page reclaim succeeds. Test
     interrupted writes and reclaim with controlled power loss; record actual ECC/
     reset behavior and verify absent calibration prevents Run/Speed after reboot.
 13. **Encoder timing and speed:** measure ANGLE acquisition-to-PWM delay and AS5600

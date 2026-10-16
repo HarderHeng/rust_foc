@@ -541,6 +541,7 @@ fn finish_align() {
             return;
         }
         latch_electrical_offset();
+        CALIBRATION_VALID.store(true, Ordering::Relaxed);
         let _ = with_pwm(|p| p.disable());
         clear_references();
         foc_isr::reset();
@@ -661,19 +662,20 @@ pub fn pwm_pct() -> u8 {
 fn latch_electrical_offset() {
     let te = crate::foc::angle::park_theta_raw(telemetry::enc_raw(), 0.0, poles());
     THETA_E_OFF_MRAD.store((te * 1000.0) as i32, Ordering::Relaxed);
-    CALIBRATION_VALID.store(true, Ordering::Relaxed);
 }
 
 pub fn calibration_valid() -> bool {
     CALIBRATION_VALID.load(Ordering::Relaxed)
 }
 
+/// Capture an unverified reference; rotor position alone cannot qualify D-axis zero.
 pub fn capture_electrical_offset() -> bool {
     cortex_m::interrupt::free(|_| {
         if mode() != Mode::Idle || !telemetry::enc_valid() {
             return false;
         }
         latch_electrical_offset();
+        CALIBRATION_VALID.store(false, Ordering::Relaxed);
         true
     })
 }

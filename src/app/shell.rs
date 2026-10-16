@@ -523,10 +523,13 @@ impl Shell {
                 let _ = self.write_all(b"PWM outputs OFF\r\n").await;
             }
             Some("align") => {
+                let Ok(id) = parse_align_args(toks) else {
+                    let _ = self.write_all(b"usage: foc align [mA]\r\n").await;
+                    return;
+                };
                 if control::mode() == control::Mode::Fault {
                     let _ = self.write_all(b"blocked: fault (foc stop)\r\n").await;
                 } else {
-                    let id = parse_i32(toks.next());
                     if !control::request_align(id) {
                         self.write_blocked().await;
                         return;
@@ -651,8 +654,9 @@ impl Shell {
                 }
                 let _ = self.write_all(b"theta_e_off=").await;
                 let _ = self.write_i32(control::theta_e_off_mrad()).await;
-                let _ = self.write_all(b" mrad ").await;
-                self.write_nvm_result().await;
+                let _ = self
+                    .write_all(b" mrad cal=empty; use foc align or foc offset <verified_mrad>\r\n")
+                    .await;
             }
             Some("save") => {
                 self.write_nvm_result().await;

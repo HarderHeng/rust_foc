@@ -205,6 +205,8 @@ pub mod driver {
         }
     }
     pub mod nvm {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        pub static SAVES: AtomicUsize = AtomicUsize::new(0);
         pub struct Record {
             pub theta_e_off_mrad: i32,
             pub poles: u8,
@@ -213,6 +215,7 @@ pub mod driver {
             None
         }
         pub fn save(_: Record) -> bool {
+            SAVES.fetch_add(1, SeqCst);
             true
         }
     }
@@ -244,6 +247,26 @@ fn control_safety_regressions() {
     assert!(!c::start(), "missing calibration blocks Run");
     assert!(!c::start_speed(100), "missing calibration blocks Speed");
     assert!(!c::persist_nvm(), "cannot save an unqualified default");
+    let default_offset = c::theta_e_off_mrad();
+    assert!(c::capture_electrical_offset());
+    assert_ne!(c::theta_e_off_mrad(), default_offset);
+    assert!(!c::calibration_valid(), "position capture is unverified");
+    assert!(!c::start(), "capturing a position cannot authorize Run");
+    assert!(
+        !c::start_speed(100),
+        "capturing a position cannot authorize Speed"
+    );
+    assert!(!c::persist_nvm(), "cannot save an unverified capture");
+    assert_eq!(driver::nvm::SAVES.load(SeqCst), 0);
+    assert!(!PWM.lock().unwrap().enabled);
+
+    let captured_offset = c::theta_e_off_mrad();
+    t::ENC_VALID.store(false, SeqCst);
+    t::RAW.store(150, SeqCst);
+    assert!(!c::capture_electrical_offset());
+    assert_eq!(c::theta_e_off_mrad(), captured_offset);
+    assert!(!c::calibration_valid());
+    t::ENC_VALID.store(true, SeqCst);
     assert!(
         c::start_openloop(500, 2),
         "Openloop does not need rotor zero"
@@ -289,6 +312,32 @@ fn control_safety_regressions() {
     assert!(c::mode() == Mode::Idle);
     assert!(c::calibration_valid());
     assert!(!PWM.lock().unwrap().enabled);
+    assert!(c::persist_nvm(), "qualified alignment can be saved");
+    assert_eq!(driver::nvm::SAVES.load(SeqCst), 1);
+    assert!(c::start(), "qualified alignment authorizes Run");
+    c::stop();
+    assert!(c::start_speed(100), "qualified alignment authorizes Speed");
+    c::stop();
+
+    // A fresh capture must revoke even a previously qualified calibration.
+    let aligned_offset = c::theta_e_off_mrad();
+    t::RAW.store(350, SeqCst);
+    assert!(c::capture_electrical_offset());
+    assert_ne!(c::theta_e_off_mrad(), aligned_offset);
+    assert!(!c::calibration_valid());
+    assert!(!c::start());
+    assert!(!c::start_speed(100));
+    assert!(!c::persist_nvm());
+    assert_eq!(driver::nvm::SAVES.load(SeqCst), 1);
+
+    // Explicit operator override remains the way to verify a known offset.
+    assert!(c::set_theta_e_off_mrad(aligned_offset));
+    let verified_offset = c::theta_e_off_mrad();
+    t::ENC_VALID.store(false, SeqCst);
+    assert!(!c::capture_electrical_offset());
+    assert_eq!(c::theta_e_off_mrad(), verified_offset);
+    assert!(c::calibration_valid());
+    t::ENC_VALID.store(true, SeqCst);
     let poles = c::poles();
     assert!(!c::set_poles(0));
     assert!(c::set_poles(poles));
@@ -299,6 +348,8 @@ fn control_safety_regressions() {
     // Manual offset is an explicit operator override.
     assert!(c::set_theta_e_off_mrad(200));
     assert!(c::calibration_valid());
+    assert!(c::persist_nvm(), "operator-verified offset can be saved");
+    assert_eq!(driver::nvm::SAVES.load(SeqCst), 2);
 
     c::set_id_ma(200);
     c::set_iq_ma(300);
@@ -309,7 +360,13 @@ fn control_safety_regressions() {
     assert!(!c::start_openloop(1000, 2), "live mode change needs stop");
     assert!(!c::set_poles(4));
     assert!(!c::set_theta_e_off_mrad(200));
+    let running_offset = c::theta_e_off_mrad();
+    t::RAW.store(500, SeqCst);
     assert!(!c::capture_electrical_offset());
+    assert_eq!(c::theta_e_off_mrad(), running_offset);
+    assert!(c::calibration_valid());
+    assert!(c::mode() == Mode::Run);
+    assert!(PWM.lock().unwrap().enabled);
     c::stop();
     assert!(!PWM.lock().unwrap().enabled);
     assert_eq!(

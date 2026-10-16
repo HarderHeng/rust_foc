@@ -100,6 +100,18 @@ pub(super) fn parse_i32(s: Option<&str>) -> Option<i32> {
     s.and_then(|t| t.parse().ok())
 }
 
+/// Omission selects the default current; malformed or extra arguments must not
+/// reach the alignment start path.
+pub(super) fn parse_align_args(
+    args: &mut core::str::SplitWhitespace<'_>,
+) -> Result<Option<i32>, ()> {
+    match (args.next(), args.next()) {
+        (None, None) => Ok(None),
+        (Some(value), None) => value.parse().map(Some).map_err(|_| ()),
+        _ => Err(()),
+    }
+}
+
 pub(super) fn parse_u8(s: Option<&str>) -> Option<u8> {
     s.and_then(|t| t.parse().ok())
 }
@@ -142,6 +154,48 @@ pub(super) fn fmt_i32(v: i32, out: &mut [u8; 12]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alignment_accepts_omitted_or_one_integer_argument() {
+        for (text, expected) in [
+            ("", None),
+            (" \t", None),
+            ("500", Some(500)),
+            (" +500 ", Some(500)),
+            ("0", Some(0)),
+            ("-1", Some(-1)),
+            ("2147483647", Some(i32::MAX)),
+            ("-2147483648", Some(i32::MIN)),
+        ] {
+            assert_eq!(
+                parse_align_args(&mut text.split_whitespace()),
+                Ok(expected),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn alignment_rejects_malformed_overflowing_or_extra_arguments() {
+        for text in [
+            "abc",
+            "500mA",
+            "0.5",
+            "1e3",
+            "+",
+            "2147483648",
+            "-2147483649",
+            "500 extra",
+            "500 600",
+            "500 600 700",
+        ] {
+            assert_eq!(
+                parse_align_args(&mut text.split_whitespace()),
+                Err(()),
+                "{text:?}"
+            );
+        }
+    }
 
     #[test]
     fn tuning_values_accept_exponents_and_long_decimals_but_not_nonfinite() {

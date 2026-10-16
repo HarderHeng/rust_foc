@@ -55,8 +55,8 @@ fn record(offset: i32) -> Record {
     }
 }
 
-// Independent copy of the existing on-flash v2 format, including its checksum.
-fn legacy_bytes(version: u16, poles: u8, offset: i32, reserved: u8) -> [u8; SLOT_SIZE] {
+// Independent on-flash fixture for the unchanged layout, including its checksum.
+fn format_bytes(version: u16, poles: u8, offset: i32, reserved: u8) -> [u8; SLOT_SIZE] {
     let mut raw = [0u8; SLOT_SIZE];
     raw[..4].copy_from_slice(b"FOC1");
     raw[4..6].copy_from_slice(&version.to_le_bytes());
@@ -73,15 +73,16 @@ fn legacy_bytes(version: u16, poles: u8, offset: i32, reserved: u8) -> [u8; SLOT
 }
 
 #[test]
-fn accepts_existing_v2_first_slot_and_valid_boundary_values() {
+fn accepts_v3_first_slot_and_valid_boundary_values() {
     for poles in [1, 7, 255] {
         for offset in [0, 1234, 6283] {
             let expected = Record {
                 poles,
                 theta_e_off_mrad: offset,
             };
-            let raw = legacy_bytes(2, poles, offset, 0);
+            let raw = format_bytes(3, poles, offset, 0);
             assert_eq!(expected.encode(), Some(raw));
+            assert_eq!(Record::decode(&raw), Some(expected));
             let mut page = Page::default();
             page.slots[0] = raw;
             assert_eq!(load(&mut page), Some(expected));
@@ -92,13 +93,15 @@ fn accepts_existing_v2_first_slot_and_valid_boundary_values() {
 #[test]
 fn rejects_invalid_fields_even_with_valid_checksum() {
     for raw in [
-        legacy_bytes(1, 7, 100, 0),
-        legacy_bytes(3, 7, 100, 0),
-        legacy_bytes(2, 0, 100, 0),
-        legacy_bytes(2, 7, -1, 0),
-        legacy_bytes(2, 7, 6284, 0),
-        legacy_bytes(2, 7, i32::MAX, 0),
-        legacy_bytes(2, 7, 100, 1),
+        format_bytes(1, 7, 100, 0),
+        format_bytes(2, 7, 100, 0),
+        format_bytes(4, 7, 100, 0),
+        format_bytes(u16::MAX, 7, 100, 0),
+        format_bytes(3, 0, 100, 0),
+        format_bytes(3, 7, -1, 0),
+        format_bytes(3, 7, 6284, 0),
+        format_bytes(3, 7, i32::MAX, 0),
+        format_bytes(3, 7, 100, 1),
     ] {
         assert_eq!(Record::decode(&raw), None);
     }
@@ -114,6 +117,63 @@ fn rejects_invalid_fields_even_with_valid_checksum() {
         assert_eq!(save(&mut page, invalid), Err(SaveError::InvalidRecord));
     }
     assert_eq!((page.erases, page.writes.len()), (0, 0));
+}
+
+#[test]
+fn v2_first_slot_is_untrusted_and_v3_appends_without_rewriting_it() {
+    let legacy = format_bytes(2, 7, 1234, 0);
+    let mut page = Page::default();
+    page.slots[0] = legacy;
+    assert_eq!(load(&mut page), None);
+    // Equal field values still need a trusted v3 record, not an Unchanged result.
+    assert_eq!(save(&mut page, record(1234)), Ok(SaveOutcome::Appended));
+    assert_eq!(page.writes, [1]);
+    assert_eq!(page.erases, 0);
+    assert_eq!(page.slots[0], legacy);
+    assert_eq!(page.slots[1], format_bytes(3, 7, 1234, 0));
+    assert_eq!(load(&mut page), Some(record(1234)));
+}
+
+#[test]
+fn mixed_journal_uses_only_v3_even_when_v2_is_later() {
+    let mut page = Page::default();
+    page.slots[0] = format_bytes(2, 7, 100, 0);
+    page.slots[1] = format_bytes(3, 7, 200, 0);
+    page.slots[2] = format_bytes(2, 7, 300, 0);
+    page.slots[3] = format_bytes(3, 7, 400, 0);
+    page.slots[4] = format_bytes(2, 7, 500, 0);
+    assert_eq!(load(&mut page), Some(record(400)));
+    page.slots[3][0] ^= 1;
+    assert_eq!(load(&mut page), Some(record(200)));
+    page.slots[1][0] ^= 1;
+    assert_eq!(load(&mut page), None);
+}
+
+#[test]
+fn every_torn_v3_append_keeps_v2_untrusted_and_consumes_partial_slots() {
+    let next = format_bytes(3, 7, 3456, 0);
+    for written in 0..SLOT_SIZE {
+        for prior_v3 in [false, true] {
+            let mut page = Page::default();
+            let legacy = format_bytes(2, 7, 100, 0);
+            page.slots[0] = legacy;
+            if prior_v3 {
+                page.slots[1] = format_bytes(3, 7, 1234, 0);
+            }
+            page.slots[2] = format_bytes(2, 7, 200, 0);
+            page.slots[3][..written].copy_from_slice(&next[..written]);
+            assert_eq!(
+                load(&mut page),
+                prior_v3.then(|| record(1234)),
+                "torn at byte {written}, prior v3: {prior_v3}"
+            );
+            assert_eq!(save(&mut page, record(4567)), Ok(SaveOutcome::Appended));
+            assert_eq!(page.writes, [if written == 0 { 3 } else { 4 }]);
+            assert_eq!(page.slots[0], legacy);
+            assert_eq!(page.erases, 0);
+            assert_eq!(load(&mut page), Some(record(4567)));
+        }
+    }
 }
 
 #[test]

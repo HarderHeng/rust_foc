@@ -1,4 +1,4 @@
-//! Version 2 calibration records in a single-page append journal.
+//! Version 3 calibration records in a single-page append journal.
 //!
 //! A torn append leaves preceding valid records readable. Reclaiming a full
 //! page erases every record before writing the replacement, so power loss
@@ -8,8 +8,10 @@ pub const SLOT_SIZE: usize = 16;
 pub const SLOT_COUNT: usize = 128;
 pub const PAGE_SIZE: usize = SLOT_SIZE * SLOT_COUNT;
 const MAGIC: u32 = 0x3143_4F46;
-// Version 1 may contain offsets from unqualified automatic alignments.
-const VERSION: u16 = 2;
+// Version 1 may contain unqualified automatic alignment offsets. Version 2
+// cannot distinguish qualified offsets from unverified `foc zero` captures.
+// Both require recalibration; keep their occupied slots consumed in the journal.
+const VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Record {
